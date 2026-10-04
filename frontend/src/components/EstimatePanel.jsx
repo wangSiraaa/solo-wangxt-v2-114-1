@@ -128,9 +128,23 @@ function EditionDetail({ v }) {
       </h3>
       {frozen && <p className="ok">
         Confirmed edition: result and equations are locked. A new equation
-        can only produce a NEW edition; this one never changes silently.
+        (or an applied measurement correction) can only produce a NEW
+        edition; this one never changes silently.
         Checksum <code>{v.equation_checksum.slice(0, 16)}…</code>.
+        {v.measurement_revision_ids?.length > 0
+          ? ` Folded revisions: ${v.measurement_revision_ids.join(", ")}.`
+          : " No measurement revisions were folded in."}
       </p>}
+      {!frozen && (
+        <p className="hint draft-rev-note">
+          Draft — computed from the current EFFECTIVE measurements.
+          {v.measurement_revision_ids?.length > 0
+            ? <> Using applied correction revisions:{" "}
+                <strong>{v.measurement_revision_ids.join(", ")}</strong>;
+                base rows are unchanged and remain reviewable.</>
+            : " No measurement revisions applied."}
+        </p>
+      )}
 
       <table className="component-table">
         <thead>
@@ -185,7 +199,36 @@ function EditionDetail({ v }) {
           <p>same-number pairs: {r.provenance.pairs_same_number} ·
             verified renumbers: {r.provenance.pairs_verified_renumber} ·
             open conflicts excluded:
-            {" "}{r.provenance.open_conflicts.length}</p>
+            {" "}{r.provenance.open_conflicts.length} ·
+            measurement revisions used:
+            {" "}{(r.provenance.measurement_revisions_applied || []).length}</p>
+
+          {(r.provenance.measurement_revisions_applied || []).length > 0 && (
+            <div className="revision-chain">
+              <strong>Measurement revision chain applied to this edition:</strong>
+              <table className="rev-table">
+                <thead>
+                  <tr><th>rev #</th><th>order #</th><th>tree</th>
+                      <th>effective dbh cm</th><th>height m</th>
+                      <th>x, y</th></tr>
+                </thead>
+                <tbody>
+                  {r.provenance.measurement_revisions_applied.map((rv) => (
+                    <tr key={rv.revision_id}>
+                      <td>{rv.revision_id}</td>
+                      <td>{rv.correction_id}</td>
+                      <td>{rv.tree}</td>
+                      <td>{rv.effective_dbh_cm}</td>
+                      <td>{rv.effective_height_m}</td>
+                      <td>{rv.effective_x_m?.toFixed(1)},
+                          {rv.effective_y_m?.toFixed(1)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           {r.provenance.open_conflicts.map((c, i) => (
             <span key={i} className="conflict-chip">
               {c.plot}/{c.field_number} ({c.hint}, {c.distance_m}m)
@@ -209,6 +252,10 @@ function EditionDetail({ v }) {
                   ` · not located: ${p.not_located.map(m => m.tree).join(", ")}`}
                 {p.equation_range_extrapolations.length > 0 &&
                   ` · EXTRAPOLATION: ${p.equation_range_extrapolations.map(e => e.tree).join(", ")}`}
+                {(p.revised_measurements || []).length > 0 &&
+                  ` · REVISED: ${p.revised_measurements.map(
+                    (m) => `${m.tree} (rev #${m.revision_id}, order #${m.correction_id})`
+                  ).join("; ")}`}
               </div>
             ))}
           </details>

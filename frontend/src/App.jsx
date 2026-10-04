@@ -3,9 +3,10 @@ import { api } from "./api.js";
 import PlotMap from "./components/PlotMap.jsx";
 import PlotDetail from "./components/PlotDetail.jsx";
 import ConflictsWorkbench from "./components/ConflictsWorkbench.jsx";
+import CorrectionsWorkbench from "./components/CorrectionsWorkbench.jsx";
 import EstimatePanel from "./components/EstimatePanel.jsx";
 
-const TABS = ["map", "conflicts", "estimates"];
+const TABS = ["map", "conflicts", "corrections", "estimates"];
 
 export default function App() {
   const [tab, setTab] = useState("map");
@@ -17,10 +18,15 @@ export default function App() {
   const [m2, setM2] = useState([]);
   const [selectedPlot, setSelectedPlot] = useState(null);
   const [conflicts, setConflicts] = useState([]);
+  const [corrections, setCorrections] = useState([]);
   const [error, setError] = useState("");
 
   async function refreshConflicts() {
     setConflicts(await api.conflicts("open"));
+  }
+
+  async function refreshCorrections() {
+    setCorrections(await api.corrections());
   }
 
   useEffect(() => {
@@ -35,13 +41,17 @@ export default function App() {
           setT1(ordered[0].code);
           setT2(ordered[ordered.length - 1].code);
         }
-        setConflicts(await api.conflicts("open"));
+        const [oc, cc] = await Promise.all([
+          api.conflicts("open"), api.corrections()]);
+        setConflicts(oc);
+        setCorrections(cc);
       } catch (e) {
         setError(e.message);
       }
     })();
   }, []);
 
+  const [measurementVersion, setMeasurementVersion] = useState(0);
   useEffect(() => {
     if (!t1 || !t2) return;
     (async () => {
@@ -50,12 +60,13 @@ export default function App() {
       setM1(a);
       setM2(b);
     })();
-  }, [t1, t2]);
+  }, [t1, t2, measurementVersion]);
 
   const ctx = useMemo(() => ({
-    plots, campaigns, t1, t2, m1, m2, conflicts,
-    setSelectedPlot, refreshConflicts,
-  }), [plots, campaigns, t1, t2, m1, m2, conflicts]);
+    plots, campaigns, t1, t2, m1, m2, conflicts, corrections,
+    setSelectedPlot, refreshConflicts, refreshCorrections,
+    reloadMeasurements: () => setMeasurementVersion((v) => v + 1),
+  }), [plots, campaigns, t1, t2, m1, m2, conflicts, corrections]);
 
   return (
     <div className="app">
@@ -71,6 +82,16 @@ export default function App() {
             {conflicts.length} open identity conflict
             {conflicts.length === 1 ? "" : "s"}
           </span>
+          {(() => {
+            const openCorr = corrections.filter(
+              (c) => c.status !== "applied" && c.status !== "rejected");
+            return openCorr.length > 0 ? (
+              <span className="chip corr-chip">
+                {openCorr.length} open correction order
+                {openCorr.length === 1 ? "" : "s"}
+              </span>
+            ) : null;
+          })()}
         </div>
       </header>
 
@@ -81,7 +102,12 @@ export default function App() {
           <button key={t} className={tab === t ? "tab active" : "tab"}
                   onClick={() => setTab(t)}>
             {t === "map" ? "Plots & individuals"
-              : t === "conflicts" ? `Identity conflicts (${conflicts.length})`
+              : t === "conflicts"
+                  ? `Identity conflicts (${conflicts.length})`
+              : t === "corrections"
+                  ? `Measurement corrections (${corrections.filter(
+                      (c) => c.status !== "applied"
+                            && c.status !== "rejected").length})`
               : "Estimates"}
           </button>
         ))}
@@ -99,6 +125,12 @@ export default function App() {
                               onChanged={async () => {
                                 setConflicts(await api.conflicts("open"));
                               }} />
+        )}
+        {tab === "corrections" && (
+          <CorrectionsWorkbench onChanged={async () => {
+            setCorrections(await api.corrections());
+            ctx.reloadMeasurements();
+          }} />
         )}
         {tab === "estimates" && <EstimatePanel ctx={ctx} />}
       </main>

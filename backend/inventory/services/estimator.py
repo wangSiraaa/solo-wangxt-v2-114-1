@@ -95,22 +95,33 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
     def rows_for(campaign):
         out = []
         from inventory.models import TreeMeasurement
+        from inventory.services.revisions import effective_revision_map
         qs = (
             TreeMeasurement.objects
             .filter(campaign=campaign)
             .select_related("tree", "tree__plot", "tree__species",
                             "tree__superseded_tree")
         )
-        for m in qs:
+        measurements = list(qs)
+        rev_map = effective_revision_map(
+            campaign=campaign,
+            measurement_ids=[m.id for m in measurements])
+        for m in measurements:
+            rev = rev_map.get(m.id)
             out.append({
                 "tree_id": m.tree_id,
+                "measurement_id": m.id,
                 "plot": m.tree.plot.code,
                 "species": m.tree.species.code,
                 "field_number": m.field_number_seen,
-                "x_m": m.x_m, "y_m": m.y_m,
-                "status": m.status,
-                "dbh_cm": m.dbh_cm,
-                "height_m": m.height_m,
+                # effective values: base row unless a correction revised it
+                "x_m": rev.x_m if rev else m.x_m,
+                "y_m": rev.y_m if rev else m.y_m,
+                "status": rev.status if rev else m.status,
+                "dbh_cm": rev.dbh_cm if rev else m.dbh_cm,
+                "height_m": rev.height_m if rev else m.height_m,
+                "revision_id": rev.id if rev else None,
+                "correction_id": rev.correction_id if rev else None,
                 "verified_renumber_of": (
                     m.tree.superseded_tree_id
                     if campaign == t2_campaign
@@ -180,6 +191,7 @@ class PlotComponents:
     extrapolation_ids: list = None
     equation_missing_input_ids: list = None
     excluded_conflict_ids: list = None
+    revised_measurements: list = None
     stock_t1_kg: float = 0.0
     stock_t2_kg: float = 0.0
     stock_t1_resid_var: float = 0.0
@@ -189,7 +201,7 @@ class PlotComponents:
         for f in ("survivor_zero_growth", "survivor_missing", "mortality_ids",
                   "ingrowth_ids", "below_recruitment_ids", "missing_tree_ids",
                   "extrapolation_ids", "equation_missing_input_ids",
-                  "excluded_conflict_ids"):
+                  "excluded_conflict_ids", "revised_measurements"):
             if getattr(self, f) is None:
                 setattr(self, f, [])
 
@@ -372,6 +384,31 @@ def compute_plot_components(plot_code, plot_info, pairing, equations,
             "hint": c.get("hint", "same_number_position_mismatch"),
             "reason": "unverified identity — excluded until human checks",
         })
+
+    # ---- measurement revisions (applied correction orders) used here
+    for pair in pairing["pairs"]:
+        for r, occ in ((pair["t1"], "t1"), (pair["t2"], "t2")):
+            if (r["plot"] == plot_code and r.get("revision_id")
+                    and not any(x["revision_id"] == r["revision_id"]
+                                for x in pc.revised_measurements)):
+                pc.revised_measurements.append({
+                    "tree": f"{plot_code}/{r['field_number']}",
+                    "revision_id": r["revision_id"],
+                    "correction_id": r["correction_id"],
+                    "occasion": occ,
+                })
+    for group, occ in ((pairing["t1_only"], "t1_only"),
+                       (pairing["t2_only"], "t2_only")):
+        for r in group:
+            if (r["plot"] == plot_code and r.get("revision_id")
+                    and not any(x["revision_id"] == r["revision_id"]
+                                for x in pc.revised_measurements)):
+                pc.revised_measurements.append({
+                    "tree": f"{plot_code}/{r['field_number']}",
+                    "revision_id": r["revision_id"],
+                    "correction_id": r["correction_id"],
+                    "occasion": occ,
+                })
 
     # ---- ratio imputation for survivors alive-but-unmeasured at t2
     observed_growth = pc.survivor_kg
@@ -586,11 +623,26 @@ def estimate(table_t1, table_t2, equations, plots, strata, design,
     ))
 
     # provenance / data quality listing
+    revised_rows = {}
+    for r in table_t1 + table_t2:
+        if r.get("revision_id") and r["revision_id"] not in revised_rows:
+            revised_rows[r["revision_id"]] = {
+                "revision_id": r["revision_id"],
+                "correction_id": r["correction_id"],
+                "tree": f"{r['plot']}/{r['field_number']}",
+                "effective_dbh_cm": r["dbh_cm"],
+                "effective_height_m": r["height_m"],
+                "effective_x_m": r["x_m"],
+                "effective_y_m": r["y_m"],
+                "status": r["status"],
+            }
     provenance = {
         "pairs_same_number": sum(1 for p in pairing["pairs"]
                                  if p["kind"] == "same_number"),
         "pairs_verified_renumber": sum(1 for p in pairing["pairs"]
                                        if p["kind"] == "renumber"),
+        "measurement_revisions_applied": sorted(revised_rows.values(),
+                                                key=lambda x: x["revision_id"]),
         "open_conflicts": [
             {"plot": (c.get("t1") or c.get("t2"))["plot"],
              "field_number": (c.get("t1") or c.get("t2"))["field_number"],
@@ -658,6 +710,7 @@ def _pc_provenance(pc):
         "equation_range_extrapolations": pc.extrapolation_ids,
         "equation_missing_inputs": pc.equation_missing_input_ids,
         "excluded_identity_conflicts": pc.excluded_conflict_ids,
+        "revised_measurements": pc.revised_measurements,
         "kg": {
             "survivor_growth": round(pc.survivor_kg, 3),
             "mortality": round(pc.mortality_kg, 3),

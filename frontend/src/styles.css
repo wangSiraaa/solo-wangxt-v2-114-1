@@ -103,3 +103,36 @@ footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
 @media (max-width: 900px) {
   .detail-grid, .two-col { grid-template-columns: 1fr; }
 }
+
+/* ---- measurement correction orders ----------------------------------- */
+.corr-chip { background: #ede7f6; border-color: #c5b3e6; color: #4527a0; }
+.badge.status-pending { background: #fdf3dd; color: #9a6b00; }
+.badge.status-reviewed { background: #e3f0fd; color: #0d47a1; }
+.badge.status-applied { background: #e7f6e9; color: var(--green); }
+.badge.status-rejected { background: #eceff1; color: #546e7a; }
+.badge.status-failed { background: #fdecec; color: var(--red); }
+.block-reason { color: var(--red); font-size: 11px; }
+.correction-detail { background: #fff; border: 1px solid var(--line);
+  border-radius: 10px; padding: 12px 16px; margin-top: 14px; }
+.action-row { display: flex; gap: 10px; align-items: center;
+  flex-wrap: wrap; margin-top: 12px; }
+.ok-inline { color: var(--green); font-size: 13px; }
+button.danger { border-color: #e4b3b3; color: var(--red); }
+.oldnew .old { color: var(--red); }
+.oldnew .new { color: var(--green); font-weight: 700; }
+.oldnew.changed .old { text-decoration: line-through; }
+.delta-badge { background: #ede7f6; color: #4527a0; border-radius: 8px;
+  padding: 1px 7px; font-size: 10px; margin-left: 4px; }
+.revision-banner { background: #ede7f6; border: 1px solid #c5b3e6;
+  color: #4527a0; border-radius: 8px; padding: 8px 12px; margin: 10px 0;
+  font-size: 13px; }
+td.revised-cell strong { color: #4527a0; }
+.base-struck { display: block; color: var(--muted); font-size: 11px; }
+.base-struck { text-decoration: line-through; }
+.rev-tags { margin-top: 3px; }
+.rev-chip { display: inline-block; background: #ede7f6; color: #4527a0;
+  border-radius: 8px; padding: 1px 7px; font-size: 10px; margin: 1px 3px 1px 0; }
+.revision-chain { margin: 8px 0; }
+.rev-table { font-size: 11px; }
+.rev-table th { background: #f0ebf8; }
+.draft-rev-note code { font-size: 11px; }

@@ -31,4 +31,17 @@ export const api = {
   estimate: (id) => get(`/estimates/${id}/`),
   createEstimate: (payload) => post("/estimates/", payload),
   confirmEstimate: (id) => post(`/estimates/${id}/confirm/`),
+
+  // measurement correction orders (测量更正单)
+  corrections: (status) =>
+    get(`/corrections/${status ? `?status=${status}` : ""}`),
+  correction: (id) => get(`/corrections/${id}/`),
+  submitCorrection: (payload) => post("/corrections/", payload),
+  reviewCorrection: (id, payload) =>
+    post(`/corrections/${id}/review/`, payload),
+  correctionImpact: (id) => get(`/corrections/${id}/impact/`),
+  applyCorrection: (id) => post(`/corrections/${id}/apply/`),
+  recomputeCorrection: (id, payload) =>
+    post(`/corrections/${id}/recompute/`, payload || {}),
+  revisions: () => get("/revisions/"),
 };

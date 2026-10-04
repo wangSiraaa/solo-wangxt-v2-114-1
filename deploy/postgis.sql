@@ -159,3 +159,64 @@ DROP TRIGGER IF EXISTS inventory_equation_freeze_trg
 CREATE TRIGGER inventory_equation_freeze_trg
 BEFORE UPDATE ON inventory_allometricequation
 FOR EACH ROW EXECUTE FUNCTION inventory_equation_freeze();
+
+-- =====================================================================
+-- Measurement correction orders + appended revisions.
+--
+-- Corrections NEVER update inventory_treemeasurement (the historical row,
+-- above, keeps its geometry and immutable transcription). An applied
+-- correction APPENDS an inventory_measurementrevision row instead. The
+-- estimator reads the latest 'effective' revision; this generated point
+-- geometry and the in-plot check give the corrected coordinates the same
+-- PostGIS guarantees the base rows have.
+-- =====================================================================
+ALTER TABLE inventory_measurementrevision
+  ADD COLUMN IF NOT EXISTS geom geometry(Point, 32650);
+
+CREATE OR REPLACE FUNCTION inventory_meas_revision_geom_fill()
+RETURNS trigger AS $$
+BEGIN
+  NEW.geom := ST_SetSRIDIMENSION(
+    ST_MakePoint(NEW.x_m, NEW.y_m), 32650, 2);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inventory_meas_revision_geom_trigger
+  ON inventory_measurementrevision;
+CREATE TRIGGER inventory_meas_revision_geom_trigger
+BEFORE INSERT OR UPDATE ON inventory_measurementrevision
+FOR EACH ROW EXECUTE FUNCTION inventory_meas_revision_geom_fill();
+
+UPDATE inventory_measurementrevision SET x_m = x_m;
+
+CREATE INDEX IF NOT EXISTS inventory_measurementrevision_geom_gix
+  ON inventory_measurementrevision USING GIST (geom);
+
+-- exactly ONE authoritative revision per measurement (DB-level backstop;
+-- the app promotes pending -> effective inside one transaction)
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_effective_revision_per_measurement_pg
+  ON inventory_measurementrevision (measurement_id)
+  WHERE revision_status = 'effective';
+
+-- a corrected stem must still fall inside its plot boundary
+ALTER TABLE inventory_measurementrevision DROP CONSTRAINT IF EXISTS
+  inventory_revision_stem_in_plot;
+ALTER TABLE inventory_measurementrevision
+  ADD CONSTRAINT inventory_revision_stem_in_plot CHECK (
+    EXISTS (
+      SELECT 1
+        FROM inventory_treemeasurement m
+        JOIN inventory_tree t ON t.id = m.tree_id
+        JOIN inventory_plot p ON p.id = t.plot_id
+       WHERE m.id = inventory_measurementrevision.measurement_id
+         AND ST_Contains(p.geom, inventory_measurementrevision.geom)
+    )
+  );
+
+-- corrected raw dbh/height still carry explicit, known units
+ALTER TABLE inventory_measurementrevision
+  DROP CONSTRAINT IF EXISTS inventory_revision_dbh_unit_known;
+ALTER TABLE inventory_measurementrevision
+  ADD CONSTRAINT inventory_revision_dbh_unit_known
+  CHECK (dbh_raw IS NULL OR dbh_unit IN ('cm', 'mm', 'in'));

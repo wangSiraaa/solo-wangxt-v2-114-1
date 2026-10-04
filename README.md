@@ -71,6 +71,31 @@ Y = Σ_h Y_h，SE 跨层合成（Welch–Satterthwaite 自由度，t 分布 95% 
 * 确认时同时**锁定所用方程**（系数不可改）；新系数必须以**新方程 code/version** 录入，
   并产生**新版本估计**，旧版本数字永不改变。
 
+### 1.7 测量更正单（MeasurementCorrection）闭环
+外业复核发现转录错误（如 **2024 复测把 25.0 cm 误抄为 250（mm）**，旧批量导入
+把规范列错存成 250 cm，且错误值已进入已确认估计）时，走更正单闭环而**绝不改历史行**：
+
+* **更正单必须指向原 `TreeMeasurement`**，提交时快照：
+  原始 raw 值与单位、规范值、坐标 `(x_m,y_m)`、状态、原因、证据清单（照片/内业页/手簿）。
+* 状态流转：`pending → reviewed → applied | rejected`；
+  `failed` 是应用未完成时可重试的侧态（中断、或被 open 身份矛盾拦截）。
+* **幂等提交**：同一 `idempotency_key` 永远返回同一张更正单（第二次 `200` +
+  `Idempotent-Replay: true`），不会生成第二张。
+* 应用时**新增一条可追溯的 `MeasurementRevision`**（原始测量行永不被覆盖），
+  修订链 `supersedes` 可回看；每条测量至多一条 `effective` 修订（部分唯一索引兜底）。
+* 应用后**重新扫描身份矛盾**（基于生效坐标，而非旧基础行）。
+  坐标更正若使该株落入某个 **open** `IdentityConflict`，应用返回 **409**、
+  更正单置 `failed` 并把新触发的矛盾打标签落库——**不得绕过人工核实**；
+  人工 resolve（renumber/distinct）后重试才可应用。
+* **只有新的 draft `EstimateVersion` 会使用修订**（M2M + design snapshot +
+  provenance 三重记录修订 ID）；已确认版本的结果载荷、方程校验和、来源
+  （provenance）原样可回看，数字逐字节不变。
+* 两阶段落库（`pending → effective`，中断残留标 `void`）+ 启动/读取时
+  `reconcile_interrupted_applications()`：应用中断后刷新只看到完整的
+  pending/failed 状态；重试幂等，**不会产生第二个有效修订**。
+* API：提交 / 审核 / 影响范围（新旧差异、被阻断身份项、确认版清单）/ 应用 /
+  按更正单重算（生成新 draft），外加只读修订台账 `/api/revisions/`。
+
 ---
 
 ## 2. 不确定性假设（结果中完整输出）
@@ -113,11 +138,16 @@ npm install
 npm run dev          # http://localhost:5173, /api 代理到 8123
 ```
 
-界面三页：
+界面四页：
 1. **Plots & individuals**：SVG 地图显示全部样地边界与 t2 个体状态；点入样地看 t1→t2 复测、
-   改号、零生长/缺测/死亡着色；
-2. **Identity conflicts**：编号矛盾核实工作台（renumber / distinct）；
-3. **Estimates**：选择方程→跑 draft→查看分量、来源、不确定性→确认冻结。
+   改号、零生长/缺测/死亡着色；测量值以**生效视图**展示（修订覆盖），基础历史值划线保留，
+   修订链与更正单号内联显示；
+2. **Identity conflicts**：编号矛盾核实工作台（renumber / distinct），
+   含“由哪张更正单触发”的标记；
+3. **Measurement corrections**：测量更正单工作台——提交链/审核/影响范围
+   （新旧差异、被阻断身份项、确认版永不改变）/ 应用 / 按更正单重算新 draft；
+4. **Estimates**：选择方程→跑 draft→查看分量、来源、不确定性、**修订链**与被阻断身份项
+   →确认冻结。
 
 ---
 
@@ -130,9 +160,15 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 | GET | `/api/conflicts/?status=open` | 同号位置矛盾 |
 | POST | `/api/conflicts/{id}/resolve/` | `{status: renumber|distinct, note}` |
 | POST | `/api/imports/` | 批量入库（拒收单位错误/越界行，207 返回明细） |
-| POST | `/api/estimates/` | 运行 draft 估计 |
+| POST | `/api/estimates/` | 运行 draft 估计（基于当前生效测量值） |
 | POST | `/api/estimates/{id}/confirm/` | 冻结版本并锁定方程 |
 | GET | `/api/estimates/{id}/` | 完整结果：分量 + 来源 + 不确定性 |
+| GET/POST | `/api/corrections/` | 更正单列表 / 幂等提交（pending） |
+| POST | `/api/corrections/{id}/review/` | 审核：`{decision: apply|reject, …}` |
+| GET | `/api/corrections/{id}/impact/` | 影响范围：新旧差异、身份阻断项、确认版清单 |
+| POST | `/api/corrections/{id}/apply/` | 应用：追加修订 + 重扫身份（可重试，409=被矛盾拦截） |
+| POST | `/api/corrections/{id}/recompute/` | 按该修订重算，生成**新 draft** |
+| GET | `/api/revisions/` | 修订台账（effective/superseded/void 全保留） |
 
 ### 入库行示例
 ```json
@@ -154,8 +190,20 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 ```bash
 cd backend && python3 manage.py test inventory
 ```
-12 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
-不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫。
+20 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
+不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫，
+以及测量更正单闭环（G 组 8 项）：
+
+* **G1 单位更正**：审核通过并应用后，**新 draft 数字改变、旧 confirmed 逐字节不变**
+  （结果、方程校验和、provenance 均可回看），仅新 draft 记录修订 ID；
+* **G2 幂等**：相同幂等键重复提交只得到**同一张**更正单（200 + 重放头）；
+* **G3 矛盾审核**：同一测量已有未结更正单时禁止再开；rejected 的不能被 apply；
+  互斥结论不可能同时 applied；
+* **G4 坐标更正人工门**：坐标更正触发 open `IdentityConflict` 时应用 409/failed、
+  新矛盾打标签落库，人工 resolve 后重试才生效——不得绕过人工核实；
+* **G5 中断恢复**：应用中断（pending 修订残留）刷新后只保留完整 void/failed 状态，
+  重试幂等、**不会生成第二个有效修订**；
+* **G6/G7 修订台账、provenance 追踪、链式更正 supersedes**：基础行永不被覆盖。
 
 ## 6. 虚构演示数据场景索引
 * `P01/004` 两次胸径相同 → **真实零生长**；
@@ -167,3 +215,7 @@ cd backend && python3 manage.py test inventory
 * `P04/002` dbh 102 cm → **超出方程径阶范围**标记；
 * 4 条坏行（mm 当 cm、树高 cm 当 m、缺单位、坐标越界）→ **入库拒收**；
 * 样地面积 0.20 / 0.50 / 1.00 ha 不等。
+* `P02/007` 2024 复测：真 25.0 cm 被旧批量导入误存为规范 250 cm（“25.0 cm 误抄为
+  250 mm”场景），种子数据预置一张 **pending 测量更正单**
+  （幂等键 `seed-P02-007-2024-unit-fix`），可在 Measurement corrections 页走
+  审核→应用→重算新 draft 全流程。

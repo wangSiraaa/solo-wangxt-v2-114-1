@@ -106,6 +106,11 @@ P02_TREES = [
     ("117", "OAK", (40, 60), (AM, 19.0, 13.0), None),
     ("118", "OAK", (40.4, 60.2), None, (AM, 19.7, 13.3)),
     ("201", "BIR", (65, 30), None, (AM, 6.4, 6.2)),
+    # 2024 remeasure review case: t2 true dbh 25.0 cm; the LEGACY bulk
+    # loader later overwrites the canonical column to 250 cm (see
+    # LEGACY_LOADED_T2). The row itself is imported here with the valid
+    # value so the modern range guard accepts it.
+    ("007", "OAK", (8, 30), (AM, 24.0, 16.0), (AM, 25.0, 17.0)),
 ]
 
 P03_TREES = [
@@ -157,16 +162,49 @@ BAD_ROWS_T2 = [
 ]
 
 
+# Trees whose t2 canonical value must be written by a post-import
+# "legacy bulk load" step (values the modern range guard would reject).
+# Maps (plot, tag) -> (raw, unit, canonical): reproduces the historical
+# transcription error the field review found: 25.0 cm mistranscribed as
+# "250" by the legacy loader (canonical wrongly 250 cm).
+LEGACY_LOADED_T2 = {
+    ("P02", "007"): (250.0, "cm", 250.0),
+}
+
+# A pending measurement correction order is opened for the mistranscribed
+# P02/007 record so the correction workflow is demonstrable end-to-end.
+MEASUREMENT_CORRECTIONS = [
+    dict(
+        plot="P02", field_number="007", campaign="2024",
+        idempotency_key="seed-P02-007-2024-unit-fix",
+        reason="2024 remeasure review: true dbh 25.0 cm was mistranscribed "
+               "as 250 (mm) by the legacy bulk loader, which stored 250 cm. "
+               "Field datasheet page 14 and tape photo IMG-2024-P02-007 "
+               "confirm 250 mm = 25.0 cm.",
+        evidence=[
+            {"type": "photo", "ref": "IMG-2024-P02-007",
+             "note": "diameter tape reads 25.0 cm"},
+            {"type": "datasheet", "ref": "P02-2024-p14",
+             "note": "handwritten 25.0 cm, mm column struck through"},
+        ],
+        corrected_dbh_raw=250.0, corrected_dbh_unit="mm",
+    ),
+]
+
+
 class Command(BaseCommand):
     help = "Seed fictional permanent-plot data (idempential wipe + recreate)."
 
     @transaction.atomic
     def handle(self, *args, **options):
         from inventory.models import (
-            EstimateVersion, IdentityConflict, MeasurementImportRow,
+            EstimateVersion, IdentityConflict, MeasurementCorrection,
+            MeasurementImportRow, MeasurementRevision,
             Tree, TreeMeasurement,
         )
-        models = [EstimateVersion, IdentityConflict, MeasurementImportRow,
+        from inventory.services.corrections import submit_correction
+        models = [MeasurementRevision, MeasurementCorrection,
+                  EstimateVersion, IdentityConflict, MeasurementImportRow,
                   TreeMeasurement, Tree, Plot, Campaign,
                   AllometricEquation, Species, Stratum]
         for m in models:
@@ -303,5 +341,33 @@ class Command(BaseCommand):
                 f"  {f['plot']}/{f['field_number']} -> "
                 f"{f.get('t2_field_number')} d={f['distance_m']}m "
                 f"[{f['hint']}]")
+
+        # ---- legacy bulk-load artifact + pending correction order ------
+        for (plot_code, tag), (raw, unit, canonical) in LEGACY_LOADED_T2.items():
+            m = (TreeMeasurement.objects
+                 .filter(campaign=t2, tree__plot__code=plot_code,
+                         field_number_seen=tag).first())
+            if m is not None:
+                m.dbh_raw, m.dbh_unit, m.dbh_cm = raw, unit, canonical
+                m.save(update_fields=["dbh_raw", "dbh_unit", "dbh_cm"])
+                self.stdout.write(
+                    f"legacy load artifact: {plot_code}/{tag} canonical "
+                    f"dbh set to {canonical} cm (raw {raw} {unit})")
+
+        for spec in MEASUREMENT_CORRECTIONS:
+            m = (TreeMeasurement.objects
+                 .filter(campaign__code=spec["campaign"],
+                         tree__plot__code=spec["plot"],
+                         field_number_seen=spec["field_number"]).first())
+            if m is None:
+                continue
+            data = {k: v for k, v in spec.items()
+                    if k not in ("plot", "field_number", "campaign")}
+            order, created = submit_correction(m, data,
+                                               submitted_by="field-review")
+            self.stdout.write(
+                f"correction order #{order.id} for {spec['plot']}/"
+                f"{spec['field_number']} ({order.status}) "
+                f"key={spec['idempotency_key']}")
 
         self.stdout.write(self.style.SUCCESS("seed complete"))

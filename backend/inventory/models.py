@@ -69,6 +69,44 @@ VERSION_STATUS_CHOICES = [
     (VERSION_SUPERSEDED, "Superseded by a newer confirmed version"),
 ]
 
+# Measurement correction order lifecycle:
+#   pending  — submitted, awaiting supervisory review;
+#   reviewed — reviewer approved ("apply"); waiting to be applied;
+#   applied  — one effective MeasurementRevision exists (terminal);
+#   rejected — reviewer rejected (terminal);
+#   failed   — an application attempt did not complete (interrupted, or an
+#              open identity contradiction blocks it). Retryable; never
+#              creates a second effective revision.
+CORRECTION_PENDING = "pending"
+CORRECTION_REVIEWED = "reviewed"
+CORRECTION_APPLIED = "applied"
+CORRECTION_REJECTED = "rejected"
+CORRECTION_FAILED = "failed"
+CORRECTION_STATUS_CHOICES = [
+    (CORRECTION_PENDING, "Pending review"),
+    (CORRECTION_REVIEWED, "Reviewed — approved, awaiting application"),
+    (CORRECTION_APPLIED, "Applied — effective revision issued"),
+    (CORRECTION_REJECTED, "Rejected by reviewer"),
+    (CORRECTION_FAILED, "Application incomplete/failed — retry or reject"),
+]
+
+# A revision is written in TWO phases so a crash mid-application can never
+# leave a half-applied measurement silently:
+#   pending    — phase 1 row, not yet authoritative;
+#   effective  — the single authoritative revision of its measurement;
+#   superseded — demoted when a later correction chains onto it (kept);
+#   void       — an interrupted/blocked attempt, kept for audit only.
+REVISION_PENDING = "pending"
+REVISION_EFFECTIVE = "effective"
+REVISION_SUPERSEDED = "superseded"
+REVISION_VOID = "void"
+REVISION_STATUS_CHOICES = [
+    (REVISION_PENDING, "Pending — application interrupted, not authoritative"),
+    (REVISION_EFFECTIVE, "Effective — authoritative corrected values"),
+    (REVISION_SUPERSEDED, "Superseded by a later correction (audit chain)"),
+    (REVISION_VOID, "Void — abandoned incomplete attempt"),
+]
+
 
 class Stratum(models.Model):
     """Sampling stratum with known land area (the sampling frame)."""
@@ -319,6 +357,14 @@ class IdentityConflict(models.Model):
     )
     resolution_note = models.CharField(max_length=240, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
+    # When a coordinate correction exposes (or moves a stem into) this
+    # contradiction, the responsible correction is recorded here. Its
+    # application cannot proceed past this OPEN conflict — a human must
+    # resolve the conflict first.
+    triggered_by_correction = models.ForeignKey(
+        "MeasurementCorrection", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="triggered_conflicts",
+    )
 
     class Meta:
         ordering = ["plot__code", "field_number"]
@@ -376,6 +422,13 @@ class EstimateVersion(models.Model):
     equation_checksum = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     confirmed_at = models.DateTimeField(null=True, blank=True)
+    # Measurement revisions (correction orders) folded into this edition.
+    # Only DRAFT editions ever point at revisions: a confirmed edition's
+    # result_payload was frozen before the revision existed and stays
+    # reviewable byte-for-byte.
+    measurement_revisions = models.ManyToManyField(
+        "MeasurementRevision", related_name="estimate_versions", blank=True,
+    )
 
     class Meta:
         ordering = ["-created_at"]
@@ -392,3 +445,183 @@ class EstimateVersion(models.Model):
 
     def __str__(self):
         return f"{self.label} [{self.status}]"
+
+
+class MeasurementCorrection(models.Model):
+    """
+    A field-office measurement correction order (测量更正单).
+
+    It points at ONE original TreeMeasurement and records, BEFORE review:
+      * the measurement's ORIGINAL raw value + declared unit (as transcribed
+        in the field) AND the canonical value used in calculations;
+      * the stem coordinates;
+      * the reason and the evidence supporting the correction.
+
+    Lifecycle: pending -> reviewed -> applied | rejected (failed is a
+    retryable side state when an application cannot complete). Applying a
+    correction never overwrites the historical TreeMeasurement row: it
+    issues an appended, fully traceable MeasurementRevision instead.
+
+    ``idempotency_key`` makes repeated submissions of the same correction a
+    no-op: the client always receives the same single correction order.
+    """
+
+    measurement = models.ForeignKey(
+        TreeMeasurement, on_delete=models.PROTECT,
+        related_name="corrections",
+    )
+    idempotency_key = models.CharField(
+        max_length=80, unique=True,
+        help_text="Client-generated key; repeats return the same correction.",
+    )
+
+    reason = models.CharField(max_length=400)
+    evidence = models.JSONField(
+        help_text="Evidence list, e.g. [{type: photo, ref: ..., note: ...}].",
+    )
+
+    # Pre-review snapshot. Two layers are kept deliberately: the raw entry
+    # (original value + declared unit, auditable) and the EFFECTIVE values
+    # the calculation saw at submission time (base row or an earlier
+    # revision), so a correction arriving while another is open cannot be
+    # applied against silently changed inputs.
+    original_dbh_raw = models.FloatField(null=True, blank=True)
+    original_dbh_unit = models.CharField(
+        max_length=2, null=True, blank=True,
+        choices=[(u, u) for u in DBH_UNITS])
+    original_dbh_cm = models.FloatField(null=True, blank=True)
+    original_height_raw = models.FloatField(null=True, blank=True)
+    original_height_unit = models.CharField(
+        max_length=2, null=True, blank=True,
+        choices=[(u, u) for u in HEIGHT_UNITS])
+    original_height_m = models.FloatField(null=True, blank=True)
+    original_x_m = models.FloatField()
+    original_y_m = models.FloatField()
+    original_status = models.CharField(
+        max_length=20, choices=TREE_STATUS_CHOICES)
+    # The revision (if any) that was authoritative at submission time.
+    based_on_revision = models.ForeignKey(
+        "MeasurementRevision", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="child_corrections",
+    )
+
+    # Corrected entry requested by the field office.
+    corrected_dbh_raw = models.FloatField(null=True, blank=True)
+    corrected_dbh_unit = models.CharField(
+        max_length=2, null=True, blank=True,
+        choices=[(u, u) for u in DBH_UNITS])
+    corrected_dbh_cm = models.FloatField(null=True, blank=True)
+    corrected_height_raw = models.FloatField(null=True, blank=True)
+    corrected_height_unit = models.CharField(
+        max_length=2, null=True, blank=True,
+        choices=[(u, u) for u in HEIGHT_UNITS])
+    corrected_height_m = models.FloatField(null=True, blank=True)
+    corrected_x_m = models.FloatField()
+    corrected_y_m = models.FloatField()
+    corrected_status = models.CharField(
+        max_length=20, choices=TREE_STATUS_CHOICES)
+
+    status = models.CharField(
+        max_length=10, choices=CORRECTION_STATUS_CHOICES,
+        default=CORRECTION_PENDING)
+
+    submitted_by = models.CharField(max_length=80, blank=True)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    reviewed_by = models.CharField(max_length=80, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.CharField(max_length=400, blank=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    # Why a reviewed correction could not be applied (e.g. the corrected
+    # coordinates open an unresolved identity contradiction).
+    failure_reason = models.CharField(max_length=400, blank=True)
+
+    class Meta:
+        ordering = ["-submitted_at"]
+
+    @property
+    def revision(self):
+        """The current (effective/superseded) revision of this order.
+
+        Voided crash artifacts are excluded; use ``revision_attempts`` to
+        see every attempt including voided ones.
+        """
+        return (
+            self.revision_attempts
+            .exclude(revision_status=REVISION_VOID)
+            .order_by("-created_at")
+            .first()
+        )
+
+    def __str__(self):
+        return (f"Correction #{self.pk} on measurement {self.measurement_id} "
+                f"[{self.status}]")
+
+
+class MeasurementRevision(models.Model):
+    """
+    An appended, traceable revision of one TreeMeasurement.
+
+    Applying a correction NEVER updates the historical measurement row.
+    Instead a revision row is appended; the estimator reads the latest
+    EFFECTIVE revision of every measurement, while the base row and every
+    earlier revision stay readable forever.
+
+    At most one revision per measurement may be 'effective' (enforced by a
+    partial unique index). Two-phase creation (pending -> effective, with
+    void for interrupted attempts) guarantees that retrying a crashed
+    application cannot produce a second effective revision.
+    """
+
+    measurement = models.ForeignKey(
+        TreeMeasurement, on_delete=models.PROTECT, related_name="revisions")
+    # The effective/superseded revision owns the OneToOne reverse accessor
+    # (correction.revision). A VOIDED interrupted attempt keeps the link as
+    # a plain nullable FK so a retry can create the real revision for the
+    # same correction order without a second effective row.
+    correction = models.ForeignKey(
+        MeasurementCorrection, on_delete=models.PROTECT,
+        related_name="revision_attempts")
+    supersedes = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="superseded_by",
+        help_text="The effective revision this one replaces, if any.",
+    )
+
+    # Effective values after this revision.
+    dbh_cm = models.FloatField(null=True, blank=True)
+    height_m = models.FloatField(null=True, blank=True)
+    x_m = models.FloatField()
+    y_m = models.FloatField()
+    status = models.CharField(max_length=20, choices=TREE_STATUS_CHOICES)
+    # The corrected raw transcription is stored here too, so the chain
+    # raw entry -> corrected entry is complete without the correction row.
+    dbh_raw = models.FloatField(null=True, blank=True)
+    dbh_unit = models.CharField(max_length=2, null=True, blank=True,
+                                choices=[(u, u) for u in DBH_UNITS])
+    height_raw = models.FloatField(null=True, blank=True)
+    height_unit = models.CharField(max_length=2, null=True, blank=True,
+                                   choices=[(u, u) for u in HEIGHT_UNITS])
+
+    revision_status = models.CharField(
+        max_length=10, choices=REVISION_STATUS_CHOICES,
+        default=REVISION_PENDING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    effective_at = models.DateTimeField(null=True, blank=True)
+    void_reason = models.CharField(max_length=400, blank=True)
+
+    class Meta:
+        ordering = ["measurement_id", "-created_at"]
+        indexes = [
+            models.Index(fields=["measurement", "revision_status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["measurement"],
+                condition=models.Q(revision_status=REVISION_EFFECTIVE),
+                name="uniq_effective_revision_per_measurement",
+            ),
+        ]
+
+    def __str__(self):
+        return (f"Revision of measurement {self.measurement_id} "
+                f"[{self.revision_status}]")
