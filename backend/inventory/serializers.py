@@ -5,6 +5,8 @@ from inventory.models import (
     Campaign,
     EstimateVersion,
     IdentityConflict,
+    MeasurementCorrection,
+    MeasurementRevision,
     Plot,
     Species,
     Stratum,
@@ -149,3 +151,63 @@ class MeasurementImportRowSerializer(serializers.Serializer):
 class MeasurementImportSerializer(serializers.Serializer):
     campaign = serializers.CharField()
     rows = MeasurementImportRowSerializer(many=True)
+
+
+# ------------------------------------------------------- correction orders
+class MeasurementRevisionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MeasurementRevision
+        fields = [
+            "id", "measurement", "correction", "sequence",
+            "changed_fields", "dbh_raw", "dbh_unit", "dbh_cm",
+            "height_raw", "height_unit", "height_m", "x_m", "y_m",
+            "created_at",
+        ]
+
+
+class MeasurementCorrectionSerializer(serializers.ModelSerializer):
+    revision = MeasurementRevisionSerializer(read_only=True)
+    plot_code = serializers.CharField(source="measurement.tree.plot.code",
+                                      read_only=True)
+    campaign_code = serializers.CharField(source="measurement.campaign.code",
+                                          read_only=True)
+    field_number = serializers.CharField(
+        source="measurement.field_number_seen", read_only=True)
+    tree_id = serializers.IntegerField(source="measurement.tree_id",
+                                       read_only=True)
+
+    class Meta:
+        model = MeasurementCorrection
+        fields = [
+            "id", "measurement", "tree_id", "plot_code", "campaign_code",
+            "field_number", "idempotency_key", "original_snapshot",
+            "corrected", "reason", "evidence", "status", "review_note",
+            "failure_detail", "created_at", "reviewed_at", "applied_at",
+            "revision",
+        ]
+        read_only_fields = ["status", "reviewed_at", "applied_at"]
+
+
+class CorrectionSubmitSerializer(serializers.Serializer):
+    """File a correction order. Idempotent on idempotency_key."""
+
+    measurement_id = serializers.IntegerField()
+    idempotency_key = serializers.CharField(max_length=80)
+    corrected = serializers.DictField()
+    reason = serializers.CharField(max_length=300)
+    evidence = serializers.CharField(max_length=300)
+
+
+class CorrectionReviewSerializer(serializers.Serializer):
+    decision = serializers.ChoiceField(choices=["approve", "reject"])
+    note = serializers.CharField(required=False, allow_blank=True,
+                                 max_length=300)
+
+
+class CorrectionRecomputeSerializer(serializers.Serializer):
+    equation_ids = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False
+    )
+    label = serializers.CharField(required=False, max_length=120)
+    fpc = serializers.BooleanField(required=False, default=True)
+    compare_to = serializers.IntegerField(required=False, allow_null=True)

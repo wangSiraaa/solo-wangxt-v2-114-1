@@ -31,4 +31,13 @@ export const api = {
   estimate: (id) => get(`/estimates/${id}/`),
   createEstimate: (payload) => post("/estimates/", payload),
   confirmEstimate: (id) => post(`/estimates/${id}/confirm/`),
+  corrections: (params) => get(`/corrections/${params || ""}`),
+  correction: (id) => get(`/corrections/${id}/`),
+  submitCorrection: (payload) => post("/corrections/", payload),
+  reviewCorrection: (id, payload) =>
+    post(`/corrections/${id}/review/`, payload),
+  applyCorrection: (id) => post(`/corrections/${id}/apply/`),
+  correctionImpact: (id) => get(`/corrections/${id}/impact/`),
+  recomputeCorrection: (id, payload) =>
+    post(`/corrections/${id}/recompute/`, payload),
 };

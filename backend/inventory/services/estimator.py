@@ -95,6 +95,8 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
     def rows_for(campaign):
         out = []
         from inventory.models import TreeMeasurement
+        from inventory.services.revisions import latest_revision_map
+        revisions = latest_revision_map(campaign)
         qs = (
             TreeMeasurement.objects
             .filter(campaign=campaign)
@@ -102,8 +104,9 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
                             "tree__superseded_tree")
         )
         for m in qs:
-            out.append({
+            row = {
                 "tree_id": m.tree_id,
+                "measurement_id": m.id,
                 "plot": m.tree.plot.code,
                 "species": m.tree.species.code,
                 "field_number": m.field_number_seen,
@@ -111,12 +114,30 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
                 "status": m.status,
                 "dbh_cm": m.dbh_cm,
                 "height_m": m.height_m,
+                "revision": None,
                 "verified_renumber_of": (
                     m.tree.superseded_tree_id
                     if campaign == t2_campaign
                     else None
                 ),
-            })
+            }
+            rev = revisions.get(m.id)
+            if rev is not None:
+                # Overlay the corrected effective values; the base row in
+                # the database is never rewritten.
+                row.update({
+                    "x_m": rev.x_m, "y_m": rev.y_m,
+                    "dbh_cm": rev.dbh_cm, "height_m": rev.height_m,
+                    "revision": {
+                        "revision_id": rev.id,
+                        "correction_id": rev.correction_id,
+                        "sequence": rev.sequence,
+                        "changed_fields": list(rev.changed_fields),
+                        "reason": rev.correction.reason,
+                        "evidence": rev.correction.evidence,
+                    },
+                })
+            out.append(row)
         return out
 
     return rows_for(t1_campaign), rows_for(t2_campaign), equations, plots, strata
@@ -586,11 +607,24 @@ def estimate(table_t1, table_t2, equations, plots, strata, design,
     ))
 
     # provenance / data quality listing
+    revisions_used = []
+    for occ_code, table in ((design["t1_code"], table_t1),
+                            (design["t2_code"], table_t2)):
+        for r in table:
+            if r.get("revision"):
+                revisions_used.append({
+                    "campaign": occ_code,
+                    "plot": r["plot"],
+                    "field_number": r["field_number"],
+                    "measurement_id": r["measurement_id"],
+                    **r["revision"],
+                })
     provenance = {
         "pairs_same_number": sum(1 for p in pairing["pairs"]
                                  if p["kind"] == "same_number"),
         "pairs_verified_renumber": sum(1 for p in pairing["pairs"]
                                        if p["kind"] == "renumber"),
+        "applied_revisions": revisions_used,
         "open_conflicts": [
             {"plot": (c.get("t1") or c.get("t2"))["plot"],
              "field_number": (c.get("t1") or c.get("t2"))["field_number"],

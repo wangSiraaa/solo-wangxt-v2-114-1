@@ -99,6 +99,46 @@ pre { background: #f2f5f2; border-radius: 6px; padding: 8px; font-size: 11px;
   border-radius: 10px; padding: 2px 9px; font-size: 11px; margin: 2px 4px 2px 0; }
 .assumptions { font-size: 12px; color: #37473d; padding-left: 18px; }
 .assumptions li { margin-bottom: 5px; }
+
+/* ---- measurement correction orders (测量更正单) ---- */
+.corrections { margin-top: 22px; }
+.correction-table td { font-size: 12px; }
+.corr-form { display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 8px 14px; background: #fff; border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
+.corr-form label { font-size: 11px; color: var(--muted); display: flex;
+  flex-direction: column; gap: 3px; }
+.corr-form label.wide { grid-column: span 2; }
+.corr-form input, .corr-form select { font-size: 13px; padding: 4px 6px;
+  border: 1px solid var(--line); border-radius: 5px; }
+.corr-form button { align-self: end; }
+.badge.corr-status-pending { background: #fdf3dd; color: #9a6b00; }
+.badge.corr-status-reviewed { background: #e3f0fb; color: #155a9c; }
+.badge.corr-status-applied { background: #e7f6e9; color: var(--green); }
+.badge.corr-status-rejected { background: #f0f0f0; color: #666; }
+.badge.corr-status-failed { background: #fdecec; color: var(--red); }
+tr.corr-rejected { color: var(--muted); }
+tr.corr-failed { background: #fdecec; }
+tr.corr-applied { background: #f2faf3; }
+.rev-badge { display: inline-block; background: #ede7f6; color: #4527a0;
+  border-radius: 8px; padding: 1px 7px; font-size: 11px; margin: 1px 3px; }
+.rev-badge.corr-status-pending { background: #fdf3dd; color: #9a6b00; }
+.rev-badge.corr-status-applied { background: #e7f6e9; color: var(--green); }
+.corr-diff-row s { color: var(--red); }
+.fail { display: block; color: var(--red); }
+.impact-panel { background: #fff; border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 16px; margin-top: 12px; }
+.impact-panel h4 { display: flex; justify-content: space-between;
+  align-items: baseline; }
+.impact-panel tr.changed td { background: #fdf6e0; }
+.impact-versions { font-size: 12px; padding-left: 18px; }
+.blocked { font-size: 12px; }
+.delta-nonzero { color: var(--red); font-weight: 700; }
+.revision-chain h5 { margin: 8px 0 4px; }
+.meas-id { color: var(--muted); font-size: 10px; }
+.plot-audit { margin-top: 16px; }
+.file-correction summary { cursor: pointer; color: var(--green);
+  font-size: 13px; margin: 6px 0; }
 footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
 @media (max-width: 900px) {
   .detail-grid, .two-col { grid-template-columns: 1fr; }

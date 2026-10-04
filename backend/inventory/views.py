@@ -9,10 +9,14 @@ POST /imports/                      ingest a campaign's field rows
 POST /estimates/                    run (or rerun) a DRAFT estimate
 POST /estimates/{id}/confirm/       freeze forever; locks equations
 GET  /estimates/{id}/               frozen result with provenance
+POST /corrections/                  file a measurement correction order
+POST /corrections/{id}/review/      approve (-> reviewed) or reject
+POST /corrections/{id}/apply/       append revision + rescan identity
+GET  /corrections/{id}/impact/      before/after, blocked items, editions
+POST /corrections/{id}/recompute/   new DRAFT using the revision + diff
 """
-import hashlib
-
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjValidationError
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -25,8 +29,11 @@ from inventory.models import (
     CONFLICT_DISTINCT,
     CONFLICT_OPEN,
     CONFLICT_RENUMBER,
+    CORRECTION_APPLIED,
+    CORRECTION_FAILED,
     EstimateVersion,
     IdentityConflict,
+    MeasurementCorrection,
     Plot,
     Species,
     Stratum,
@@ -38,8 +45,12 @@ from inventory.serializers import (
     CampaignSerializer,
     ConflictResolveSerializer,
     ConflictSerializer,
+    CorrectionRecomputeSerializer,
+    CorrectionReviewSerializer,
+    CorrectionSubmitSerializer,
     EquationSerializer,
     EstimateVersionSerializer,
+    MeasurementCorrectionSerializer,
     MeasurementImportSerializer,
     MeasurementSerializer,
     PlotSerializer,
@@ -48,12 +59,20 @@ from inventory.serializers import (
     TreeSerializer,
 )
 from inventory.services.conflicts import scan_conflicts
-from inventory.services.estimator import (
-    build_measurement_table,
-    estimate,
-    equation_checksum,
-    resolved_identity_pairs,
+from inventory.services.corrections import (
+    CorrectionStateError,
+    StaleSnapshotError,
+    apply_correction,
+    impact_report,
+    mark_apply_failed,
+    review_correction,
+    submit_correction,
 )
+from inventory.services.estimates import (
+    diff_result_payloads,
+    run_draft_estimate,
+)
+from inventory.services.estimator import equation_checksum
 from inventory.services.ingest import import_campaign_rows
 
 
@@ -211,49 +230,10 @@ class EstimateViewSet(viewsets.ViewSet):
             return Response({"detail": "equation_ids invalid/empty"},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        table_t1, table_t2, equations, plots, strata = (
-            build_measurement_table(t1, t2, equations_qs)
+        version = run_draft_estimate(
+            label, t1, t2, equations_qs,
+            fpc=bool(request.data.get("fpc", True)),
         )
-        uncovered = sorted({
-            r["species"] for r in table_t1 + table_t2
-            if r["species"] not in equations
-        })
-        renumber, distinct = resolved_identity_pairs(t1, t2)
-
-        interval = round(
-            (t2.measured_on - t1.measured_on).days / 365.25, 3)
-        design = {
-            "t1_code": t1.code, "t2_code": t2.code,
-            "interval_years": interval,
-            "dbh_sd_cm": settings.DBH_MEASUREMENT_SD_CM,
-            "height_sd_m": settings.HEIGHT_MEASUREMENT_SD_M,
-            "zero_tol_cm": settings.ZERO_GROWTH_TOL_CM,
-            "recruitment_cm": settings.RECRUITMENT_DBH_CM,
-            "fpc": bool(request.data.get("fpc", True)),
-            "crs_epsg": settings.SURVEY_CRS_EPSG,
-        }
-        result = estimate(table_t1, table_t2, equations, plots, strata,
-                          design,
-                          resolved_renumber_pairs=renumber,
-                          resolved_distinct_pairs=distinct)
-        result["species_without_equation"] = uncovered
-        checksum = equation_checksum(equations)
-
-        snap_strata = {code: {**s, "plot_codes": list(s["plot_codes"])}
-                       for code, s in strata.items()}
-        design_snapshot = {**design,
-                           "strata": snap_strata,
-                           "equation_ids": sorted(eq_ids),
-                           "equation_codes": {sp: e["code"] + "@" + e["version"]
-                                              for sp, e in equations.items()},
-                           "area_tolerance": settings.PLOT_AREA_TOLERANCE}
-
-        version = EstimateVersion.objects.create(
-            label=label, t1_campaign=t1, t2_campaign=t2,
-            design_snapshot=design_snapshot,
-            result_payload=result, equation_checksum=checksum,
-        )
-        version.equations.set(equations_qs)
         return Response(EstimateVersionSerializer(version).data,
                         status=status.HTTP_201_CREATED)
 
@@ -301,3 +281,188 @@ def _get_version(pk):
     from django.shortcuts import get_object_or_404
     return get_object_or_404(
         EstimateVersion.objects.prefetch_related("equations"), pk=pk)
+
+
+class CorrectionViewSet(viewsets.GenericViewSet,
+                        viewsets.mixins.ListModelMixin,
+                        viewsets.mixins.RetrieveModelMixin):
+    """
+    Measurement correction orders (测量更正单). The historical
+    TreeMeasurement rows are never edited; an applied order appends an
+    immutable revision that only NEW draft estimates pick up.
+    """
+    serializer_class = MeasurementCorrectionSerializer
+
+    def get_queryset(self):
+        qs = (MeasurementCorrection.objects
+              .select_related("measurement__tree__plot",
+                              "measurement__campaign")
+              .prefetch_related("revision"))
+        state = self.request.query_params.get("status")
+        if state:
+            qs = qs.filter(status=state)
+        measurement = self.request.query_params.get("measurement")
+        if measurement:
+            qs = qs.filter(measurement_id=measurement)
+        plot = self.request.query_params.get("plot")
+        if plot:
+            qs = qs.filter(measurement__tree__plot__code=plot)
+        return qs
+
+    def create(self, request):
+        """File an order. Same idempotency_key -> same order, never two."""
+        ser = CorrectionSubmitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        # Idempotency is checked BEFORE anything else: a replayed
+        # submission returns the original order; reusing the key with a
+        # DIFFERENT payload is a conflict, never a second order.
+        existing = MeasurementCorrection.objects.filter(
+            idempotency_key=data["idempotency_key"]).first()
+        if existing is not None:
+            same = (existing.measurement_id == data["measurement_id"]
+                    and existing.corrected == data["corrected"])
+            if not same:
+                return Response(
+                    {"detail": "idempotency_key already filed with a "
+                               "different measurement/payload"},
+                    status=status.HTTP_409_CONFLICT)
+            payload = MeasurementCorrectionSerializer(existing).data
+            payload["created"] = False
+            return Response(payload, status=status.HTTP_200_OK)
+
+        measurement = TreeMeasurement.objects.filter(
+            pk=data["measurement_id"]).first()
+        if measurement is None:
+            return Response({"detail": "unknown measurement"},
+                            status=status.HTTP_404_NOT_FOUND)
+        try:
+            order, created = submit_correction(
+                measurement,
+                idempotency_key=data["idempotency_key"],
+                corrected=data["corrected"],
+                reason=data["reason"],
+                evidence=data["evidence"],
+            )
+        except DjValidationError as exc:
+            return Response({"detail": "; ".join(exc.messages)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        payload = MeasurementCorrectionSerializer(order).data
+        payload["created"] = created
+        return Response(payload,
+                        status=status.HTTP_201_CREATED if created
+                        else status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        """Human review: {"decision": "approve"|"reject", "note": ...}."""
+        order = self.get_object()
+        ser = CorrectionReviewSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            review_correction(
+                order,
+                approve=ser.validated_data["decision"] == "approve",
+                note=ser.validated_data.get("note", ""),
+            )
+        except CorrectionStateError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        return Response(MeasurementCorrectionSerializer(order).data)
+
+    @action(detail=True, methods=["post"])
+    def apply(self, request, pk=None):
+        """
+        Append the revision and re-scan identity contradictions.
+        Atomic: a failure leaves NO partial revision, the order is marked
+        failed, and retrying never creates a second revision.
+        """
+        order = self.get_object()
+        if order.status == CORRECTION_APPLIED:
+            # idempotent: already applied, return the existing revision
+            return Response(MeasurementCorrectionSerializer(order).data)
+        try:
+            revision, conflicts = apply_correction(order)
+        except StaleSnapshotError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        except CorrectionStateError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        except DjValidationError as exc:
+            return Response({"detail": "; ".join(exc.messages)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:  # rolled back; record a clean failure
+            order = mark_apply_failed(order, exc)
+            return Response(
+                {"detail": f"apply failed and was rolled back cleanly: "
+                           f"{exc}",
+                 "status": CORRECTION_FAILED},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        order.refresh_from_db()
+        payload = MeasurementCorrectionSerializer(order).data
+        payload["identity_rescan"] = conflicts
+        return Response(payload)
+
+    @action(detail=True, methods=["get"])
+    def impact(self, request, pk=None):
+        """Before/after values, blocked identity items, affected editions."""
+        return Response(impact_report(self.get_object()))
+
+    @action(detail=True, methods=["post"])
+    def recompute(self, request, pk=None):
+        """
+        Run a NEW draft estimate that uses this order's revision, and
+        diff it against a frozen edition. Confirmed versions are never
+        recomputed — their payload, checksum and provenance stay frozen.
+        """
+        order = self.get_object()
+        if order.status != CORRECTION_APPLIED:
+            return Response(
+                {"detail": "recompute requires an applied correction "
+                           f"(status is {order.status})."},
+                status=status.HTTP_409_CONFLICT)
+        ser = CorrectionRecomputeSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        eq_ids = data["equation_ids"]
+        equations_qs = AllometricEquation.objects.filter(
+            id__in=eq_ids).prefetch_related("species")
+        if equations_qs.count() != len(eq_ids):
+            return Response({"detail": "equation_ids invalid"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        campaign = order.measurement.campaign
+        other = Campaign.objects.exclude(pk=campaign.pk).order_by(
+            "measured_on").first()
+        if other is None:
+            return Response({"detail": "need a second campaign to compare"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        t1, t2 = sorted([campaign, other], key=lambda c: c.measured_on)
+
+        label = data.get("label") or (
+            f"recompute after correction #{order.pk}")
+        version = run_draft_estimate(label, t1, t2, equations_qs,
+                                     fpc=data.get("fpc", True))
+
+        compare_to = None
+        if data.get("compare_to"):
+            compare_to = EstimateVersion.objects.filter(
+                pk=data["compare_to"]).first()
+        if compare_to is None:
+            compare_to = (EstimateVersion.objects
+                          .filter(status=VERSION_CONFIRMED)
+                          .order_by("-confirmed_at").first())
+        diff = None
+        if compare_to is not None and compare_to.result_payload:
+            diff = diff_result_payloads(compare_to.result_payload,
+                                        version.result_payload)
+            diff["compared_to"] = {"id": compare_to.id,
+                                   "label": compare_to.label,
+                                   "status": compare_to.status}
+        return Response({
+            "version": EstimateVersionSerializer(version).data,
+            "diff": diff,
+        }, status=status.HTTP_201_CREATED)

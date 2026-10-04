@@ -159,3 +159,22 @@ DROP TRIGGER IF EXISTS inventory_equation_freeze_trg
 CREATE TRIGGER inventory_equation_freeze_trg
 BEFORE UPDATE ON inventory_allometricequation
 FOR EACH ROW EXECUTE FUNCTION inventory_equation_freeze();
+
+-- ---- measurement revisions are append-only, even with direct SQL -------
+-- Corrections never rewrite history: an applied correction order appends
+-- one revision row; updates/deletes of revisions are refused.
+CREATE OR REPLACE FUNCTION inventory_revision_append_only()
+RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION
+    'MeasurementRevision % is append-only; file a new correction order.',
+    OLD.id;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inventory_revision_no_update_trg
+  ON inventory_measurementrevision;
+CREATE TRIGGER inventory_revision_no_update_trg
+BEFORE UPDATE OR DELETE ON inventory_measurementrevision
+FOR EACH ROW EXECUTE FUNCTION inventory_revision_append_only();

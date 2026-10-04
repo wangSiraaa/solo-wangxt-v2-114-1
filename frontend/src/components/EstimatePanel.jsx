@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
+import CorrectionsPanel from "./CorrectionsPanel.jsx";
 
 function Mg(kg) { return (kg / 1000).toFixed(2); }
 
@@ -113,6 +114,13 @@ export default function EstimatePanel({ ctx }) {
       </section>
 
       {detail && <EditionDetail v={detail} />}
+
+      <CorrectionsPanel
+        equations={equations}
+        onEstimateCreated={async (v) => {
+          await loadVersions();
+          setOpenId(v.id);
+        }} />
     </div>
   );
 }
@@ -191,6 +199,20 @@ function EditionDetail({ v }) {
               {c.plot}/{c.field_number} ({c.hint}, {c.distance_m}m)
             </span>
           ))}
+          {(r.provenance.applied_revisions?.length > 0) && (
+            <div className="revision-chain">
+              <h5>Measurement revisions used by this edition</h5>
+              {r.provenance.applied_revisions.map((rev) => (
+                <div key={rev.revision_id} className="plot-prov">
+                  <strong>{rev.plot}/{rev.field_number}</strong> @{rev.campaign}
+                  {" "}· revision #{rev.sequence} · correction{" "}
+                  #{rev.correction_id} · changed:{" "}
+                  {rev.changed_fields.join(", ") || "raw record only"}
+                  <br /><small>{rev.reason} — 证据: {rev.evidence}</small>
+                </div>
+              ))}
+            </div>
+          )}
           <details open>
             <summary>per-plot sources</summary>
             {r.provenance.plots.map((p) => (

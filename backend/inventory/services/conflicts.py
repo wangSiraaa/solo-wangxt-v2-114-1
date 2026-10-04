@@ -5,6 +5,10 @@ A conflict = same field number in one plot at both campaigns but the
 recorded stem positions contradict "same individual" (distance beyond
 tolerance), or a close-position pair carrying different labels that might
 be an unrecorded renumber. Nothing is merged automatically.
+
+Positions are read through the applied-revision overlay: a coordinate
+correction order changes what this scan sees, so applying a correction
+can open (or, after human verification, stop re-opening) conflicts.
 """
 from django.utils import timezone
 
@@ -14,6 +18,7 @@ from inventory.services.identity import (
     RENUMBER_SEARCH_RADIUS_M,
     _distance_m,
 )
+from inventory.services.revisions import effective_positions
 
 
 def scan_conflicts(t1_campaign, t2_campaign,
@@ -21,12 +26,13 @@ def scan_conflicts(t1_campaign, t2_campaign,
                    search_radius_m=RENUMBER_SEARCH_RADIUS_M):
     from inventory.models import TreeMeasurement
 
-    t1_qs = TreeMeasurement.objects.filter(
+    t1_qs = list(TreeMeasurement.objects.filter(
         campaign=t1_campaign
-    ).select_related("tree", "tree__plot")
-    t2_qs = TreeMeasurement.objects.filter(
+    ).select_related("tree", "tree__plot"))
+    t2_qs = list(TreeMeasurement.objects.filter(
         campaign=t2_campaign
-    ).select_related("tree", "tree__plot")
+    ).select_related("tree", "tree__plot"))
+    pos = effective_positions([*t1_qs, *t2_qs])
 
     t1_by_plot_num, t2_by_plot_num = {}, {}
     for m in t1_qs:
@@ -46,7 +52,7 @@ def scan_conflicts(t1_campaign, t2_campaign,
                 continue
             nearest = None
             for m1 in t1_list:
-                d = _distance_m(m1.x_m, m1.y_m, m2.x_m, m2.y_m)
+                d = _distance_m(*pos[m1.id], *pos[m2.id])
                 if nearest is None or d < nearest[0]:
                     nearest = (d, m1)
             d, m1 = nearest
@@ -66,7 +72,7 @@ def scan_conflicts(t1_campaign, t2_campaign,
                 continue
             if m1.field_number_seen == m2.field_number_seen:
                 continue
-            d = _distance_m(m1.x_m, m1.y_m, m2.x_m, m2.y_m)
+            d = _distance_m(*pos[m1.id], *pos[m2.id])
             if d <= search_radius_m and not _has_resolution(m1, m2):
                 found.append(_upsert(t1_campaign, t2_campaign, m1, m2, d,
                                      "possible_renumber"))

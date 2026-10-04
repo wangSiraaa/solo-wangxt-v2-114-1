@@ -71,6 +71,24 @@ Y = Σ_h Y_h，SE 跨层合成（Welch–Satterthwaite 自由度，t 分布 95% 
 * 确认时同时**锁定所用方程**（系数不可改）；新系数必须以**新方程 code/version** 录入，
   并产生**新版本估计**，旧版本数字永不改变。
 
+### 1.7 测量更正单闭环（不改写历史行）
+外业复核发现已入库记录有误（如把 25.0 cm 误抄为 250 mm）时，走**更正单**而不是改库：
+
+* `MeasurementCorrection` 必须指向原 `TreeMeasurement`，提交时冻结**原始快照**
+  （原始值、单位、规范值、坐标），并记录**更正后值、原因、证据**（复核单号/照片）。
+* 状态机：`pending → reviewed → applied / rejected`；应用失败落 `failed`（可安全重试）。
+* **应用 = 追加 `MeasurementRevision`**（append-only，模型层 + PostGIS 触发器双保险），
+  历史测量行永不被覆盖；新 draft 估计自动叠加最新修订，**已确认版本的结果、
+  方程校验和、来源始终冻结可回看**。
+* 提交幂等：`idempotency_key` 唯一，重复提交返回同一张更正单。
+* 应用是**原子**的（修订 + 状态翻转 + 身份重扫同事务）；中断后不会留下半个修订，
+  重试也不会生成第二个有效修订（`correction` OneToOne + 状态守卫）。
+* 同一测量的两张矛盾更正单**不能同时 applied**：应用时校验快照新鲜度，
+  后到者返回 409，须基于当前有效值重新开单。
+* 坐标更正后**重新扫描身份矛盾**；若触发 open `IdentityConflict`，该树对继续
+  从所有分量中剔除，**绝不绕过人工核实**。
+* 更正值入库前通过与外业入库**相同**的校验（单位显式、合理范围、样地边界内）。
+
 ---
 
 ## 2. 不确定性假设（结果中完整输出）
@@ -115,9 +133,10 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 
 界面三页：
 1. **Plots & individuals**：SVG 地图显示全部样地边界与 t2 个体状态；点入样地看 t1→t2 复测、
-   改号、零生长/缺测/死亡着色；
+   改号、零生长/缺测/死亡着色，以及该样地的**更正单修订链**与**被阻断身份项**；
 2. **Identity conflicts**：编号矛盾核实工作台（renumber / distinct）；
-3. **Estimates**：选择方程→跑 draft→查看分量、来源、不确定性→确认冻结。
+3. **Estimates**：选择方程→跑 draft→查看分量、来源、不确定性→确认冻结；
+   页内**更正单面板**可提交/审核/应用更正、查看影响范围、按更正单重算并展示**新旧差异**。
 
 ---
 
@@ -133,6 +152,23 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 | POST | `/api/estimates/` | 运行 draft 估计 |
 | POST | `/api/estimates/{id}/confirm/` | 冻结版本并锁定方程 |
 | GET | `/api/estimates/{id}/` | 完整结果：分量 + 来源 + 不确定性 |
+| GET | `/api/corrections/?status=pending` | 更正单列表（可按 measurement/plot 过滤） |
+| POST | `/api/corrections/` | 提交更正单（`idempotency_key` 幂等） |
+| POST | `/api/corrections/{id}/review/` | 审核 `{decision: approve\|reject, note}` |
+| POST | `/api/corrections/{id}/apply/` | 应用：追加修订 + 重扫身份矛盾（原子、可重试） |
+| GET | `/api/corrections/{id}/impact/` | 影响范围：前后值、被阻断身份项、受影响版本 |
+| POST | `/api/corrections/{id}/recompute/` | 按更正单重算新 draft 并输出新旧差异 |
+
+### 更正单提交示例
+```json
+{
+  "measurement_id": 280,
+  "idempotency_key": "fieldcheck-2026-P05-003-dbh",
+  "corrected": {"dbh_raw": 25.0, "dbh_unit": "cm"},
+  "reason": "外业复核：2024 复测记录 250 mm 疑似 25.0 cm 误抄",
+  "evidence": "外业复核单 FC-2026-018；复测照片 P05-003-a/b"
+}
+```
 
 ### 入库行示例
 ```json
@@ -154,8 +190,16 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 ```bash
 cd backend && python3 manage.py test inventory
 ```
-12 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
-不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫。
+20 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
+不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫，
+以及更正单闭环：
+* 单位更正应用后**新 draft 改变而旧 confirmed 不变**（载荷逐字节稳定）；
+* 相同幂等键重复提交只得到**一张**更正单；
+* 相互矛盾的更正单**不能同时 applied**（后到者 409）；
+* 坐标更正触发 open `IdentityConflict` 时树对保持剔除，**不绕过人工核实**；
+* 应用中断后只留完整 `failed` 状态、无半个修订，**重试不生成第二个有效修订**；
+* 影响范围查看与按更正单重算（新 draft + 新旧差异，confirmed 保持冻结）；
+* 更正值复用入库校验（范围/边界/单位），工作流非法跳转 409，修订 append-only。
 
 ## 6. 虚构演示数据场景索引
 * `P01/004` 两次胸径相同 → **真实零生长**；
@@ -166,4 +210,7 @@ cd backend && python3 manage.py test inventory
 * `201` 系列（dbh 4.2–6.4）→ 进界阈值边界，<5 cm 排除；
 * `P04/002` dbh 102 cm → **超出方程径阶范围**标记；
 * 4 条坏行（mm 当 cm、树高 cm 当 m、缺单位、坐标越界）→ **入库拒收**；
-* 样地面积 0.20 / 0.50 / 1.00 ha 不等。
+* 样地面积 0.20 / 0.50 / 1.00 ha 不等；
+* `P05/003` 2024 胸径原始记录为 **250 mm**（疑将 25.0 cm 误抄）→ 种子数据含一条
+  **pending 更正单**与一条**已确认估计**（其原始值已进入 confirmed 版本），
+  可在 Estimates 页走完整 审核→应用→重算 闭环。

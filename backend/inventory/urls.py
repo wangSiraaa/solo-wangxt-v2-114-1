@@ -15,5 +15,7 @@ router.register("measurements", views.MeasurementViewSet,
 router.register("conflicts", views.ConflictViewSet, basename="conflict")
 router.register("imports", views.ImportViewSet, basename="import")
 router.register("estimates", views.EstimateViewSet, basename="estimate")
+router.register("corrections", views.CorrectionViewSet,
+                basename="correction")
 
 urlpatterns = [path("", include(router.urls))]

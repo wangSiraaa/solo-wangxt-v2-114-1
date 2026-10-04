@@ -129,12 +129,23 @@ P04_TREES = [
 P05_TREES = [
     ("001", "PIN", (20, 25), (AM, 31.0, 20.0), (AM, 32.6, 20.8)),
     ("002", "PIN", (40, 45), (AM, 36.0, 22.5), (AM, 37.5, 23.1)),
+    # 2024 dbh recorded as "250 mm" — the field re-check suspects the
+    # crew wrote 25.0 cm. Canonical value is 25.0 cm either way, so the
+    # confirmed estimate is numerically right; the RAW record is what a
+    # correction order must fix (see CORRECTION_DEMO below).
     ("003", "OAK", (60, 30), (AM, 24.0, 16.0), (AM, 25.0, 16.5)),
     ("004", "BIR", (75, 70), (AM, 10.0, 9.0), (AM, 10.7, 9.4)),
     ("005", "OAK", (85, 85), (AM, 20.0, 14.0), (AM, 20.0, 14.0)),
     ("006", "BIR", (30, 70), (AM, 15.0, 11.5), (MI, None, None)),
     ("201", "BIR", (50, 80), None, (AM, 5.8, 5.6)),
 ]
+
+# Raw-entry overrides: (plot, number, campaign) -> (dbh_raw, dbh_unit).
+# P05/003 2024 is the suspected mis-transcription the demo correction
+# order refers to: stored raw is 250 mm instead of 25.0 cm.
+RAW_DBH_OVERRIDES = {
+    ("P05", "003", "2024"): (250.0, "mm"),
+}
 
 # Bad rows that ingest MUST reject:
 BAD_ROWS_T2 = [
@@ -163,12 +174,14 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
         from inventory.models import (
-            EstimateVersion, IdentityConflict, MeasurementImportRow,
-            Tree, TreeMeasurement,
+            EstimateVersion, IdentityConflict, MeasurementCorrection,
+            MeasurementImportRow, MeasurementRevision, Tree,
+            TreeMeasurement,
         )
-        models = [EstimateVersion, IdentityConflict, MeasurementImportRow,
-                  TreeMeasurement, Tree, Plot, Campaign,
-                  AllometricEquation, Species, Stratum]
+        models = [EstimateVersion, MeasurementRevision,
+                  MeasurementCorrection, IdentityConflict,
+                  MeasurementImportRow, TreeMeasurement, Tree, Plot,
+                  Campaign, AllometricEquation, Species, Stratum]
         for m in models:
             m.objects.all().delete()
 
@@ -250,10 +263,14 @@ class Command(BaseCommand):
                 shown = num
                 if code == "P01" and campaign_code == "2024":
                     shown = P01_RENUMBER.get(num, num)
+                dbh_raw, dbh_unit = v[1], ("cm" if v[1] is not None else None)
+                override = RAW_DBH_OVERRIDES.get((code, num, campaign_code))
+                if override is not None:
+                    dbh_raw, dbh_unit = override
                 rows.append(dict(
                     plot=code, field_number=shown, species=sp,
                     x_m=cfg["ox"] + dx, y_m=cfg["oy"] + dy, status=v[0],
-                    dbh_raw=v[1], dbh_unit="cm" if v[1] is not None else None,
+                    dbh_raw=dbh_raw, dbh_unit=dbh_unit,
                     height_raw=v[2],
                     height_unit="m" if v[2] is not None else None,
                     notes=("verified zero growth cross-check"
@@ -303,5 +320,43 @@ class Command(BaseCommand):
                 f"  {f['plot']}/{f['field_number']} -> "
                 f"{f.get('t2_field_number')} d={f['distance_m']}m "
                 f"[{f['hint']}]")
+
+        # --- a CONFIRMED estimate that already contains the suspect value --
+        # The 250 mm raw entry converts to the same 25.0 cm, so this
+        # edition's numbers are correct; it exists so the correction
+        # closed loop can demonstrate "confirmed stays frozen, only new
+        # drafts pick up the revision".
+        from inventory.services.estimates import run_draft_estimate
+        confirmed = run_draft_estimate(
+            "2019→2024 confirmed baseline (contains P05/003 raw 250 mm)",
+            t1, t2,
+            AllometricEquation.objects.prefetch_related("species").all(),
+            fpc=True,
+        )
+        confirmed.status = "confirmed"
+        from django.utils import timezone as _tz
+        confirmed.confirmed_at = _tz.now()
+        confirmed.save()
+        self.stdout.write(
+            f"confirmed estimate edition #{confirmed.id} frozen "
+            f"(checksum {confirmed.equation_checksum[:12]}…)")
+
+        # --- the pending correction order (测量更正单) ----------------------
+        from inventory.models import TreeMeasurement as _TM
+        from inventory.services.corrections import submit_correction
+        suspect = _TM.objects.get(
+            campaign=t2, tree__plot__code="P05", field_number_seen="003")
+        order, created = submit_correction(
+            suspect,
+            idempotency_key="fieldcheck-2026-P05-003-dbh",
+            corrected={"dbh_raw": 25.0, "dbh_unit": "cm"},
+            reason=("外业复核：2024 复测 P05/003 胸径原始记录为 250 mm，"
+                    "疑似将 25.0 cm 误抄；换算后规范值相同 (25.0 cm)，"
+                    "但原始记录与单位必须更正以备审计。"),
+            evidence="外业复核单 FC-2026-018；复测照片 P05-003-a/b",
+        )
+        self.stdout.write(
+            f"correction order #{order.id} filed [{order.status}] for "
+            f"P05/003 @2024 (raw 250 mm -> 25.0 cm)")
 
         self.stdout.write(self.style.SUCCESS("seed complete"))

@@ -69,6 +69,22 @@ VERSION_STATUS_CHOICES = [
     (VERSION_SUPERSEDED, "Superseded by a newer confirmed version"),
 ]
 
+# Measurement correction order (测量更正单) workflow. A correction never
+# edits the historical TreeMeasurement row; when applied it appends an
+# immutable MeasurementRevision that later DRAFT estimates overlay.
+CORRECTION_PENDING = "pending"
+CORRECTION_REVIEWED = "reviewed"
+CORRECTION_APPLIED = "applied"
+CORRECTION_REJECTED = "rejected"
+CORRECTION_FAILED = "failed"
+CORRECTION_STATUS_CHOICES = [
+    (CORRECTION_PENDING, "Pending review"),
+    (CORRECTION_REVIEWED, "Reviewed — approved for application"),
+    (CORRECTION_APPLIED, "Applied — revision appended"),
+    (CORRECTION_REJECTED, "Rejected at review (terminal)"),
+    (CORRECTION_FAILED, "Application failed — safe to retry"),
+]
+
 
 class Stratum(models.Model):
     """Sampling stratum with known land area (the sampling frame)."""
@@ -325,6 +341,124 @@ class IdentityConflict(models.Model):
 
     def __str__(self):
         return f"{self.plot.code}/{self.field_number}: {self.status}"
+
+
+class MeasurementCorrection(models.Model):
+    """
+    A correction order (测量更正单) against ONE TreeMeasurement.
+
+    Closed loop: pending -> reviewed -> applied / rejected (failed is a
+    retryable apply outcome, never a half-written state).
+
+    * ``original_snapshot`` freezes the measurement's EFFECTIVE values
+      (base row + latest applied revision) at submission time — raw value,
+      unit, canonical value and coordinates — so the "before" state is
+      auditable even after later corrections land.
+    * ``corrected`` carries the proposed raw values/units/coordinates.
+    * Applying NEVER updates the historical TreeMeasurement row; it
+      appends an immutable MeasurementRevision. Only EstimateVersions
+      created after the application see the revised values — confirmed
+      editions keep their frozen payload, checksum and provenance.
+    * ``idempotency_key`` is client-supplied and unique: resubmitting the
+      same key returns the same order instead of creating a duplicate.
+    """
+
+    measurement = models.ForeignKey(
+        TreeMeasurement, on_delete=models.PROTECT, related_name="corrections"
+    )
+    idempotency_key = models.CharField(max_length=80, unique=True)
+    original_snapshot = models.JSONField(
+        help_text="Effective values at submission: field_number_seen, "
+                  "status, dbh_raw/dbh_unit/dbh_cm, height_raw/height_unit/"
+                  "height_m, x_m, y_m, and the revision they came from."
+    )
+    corrected = models.JSONField(
+        help_text="Proposed values (subset of dbh_raw, dbh_unit, "
+                  "height_raw, height_unit, x_m, y_m)."
+    )
+    reason = models.CharField(max_length=300)
+    evidence = models.CharField(
+        max_length=300,
+        help_text="Field-check sheet / photo / instrument log reference."
+    )
+    status = models.CharField(
+        max_length=10, choices=CORRECTION_STATUS_CHOICES,
+        default=CORRECTION_PENDING
+    )
+    review_note = models.CharField(max_length=300, blank=True)
+    failure_detail = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["measurement", "status"]),
+        ]
+
+    def __str__(self):
+        return f"correction#{self.pk} on measurement {self.measurement_id} " \
+               f"[{self.status}]"
+
+
+class MeasurementRevision(models.Model):
+    """
+    Append-only effective-value layer over TreeMeasurement.
+
+    Each applied correction appends exactly one revision holding the full
+    effective state AFTER the correction (raw + canonical + coordinates).
+    The latest revision per measurement is what new draft estimates use;
+    the base row and every revision stay queryable for audit. Revisions
+    are immutable: updates and deletes are refused here and, on
+    PostgreSQL, by trigger (deploy/postgis.sql).
+    """
+
+    measurement = models.ForeignKey(
+        TreeMeasurement, on_delete=models.PROTECT, related_name="revisions"
+    )
+    correction = models.OneToOneField(
+        MeasurementCorrection, on_delete=models.PROTECT,
+        related_name="revision"
+    )
+    sequence = models.PositiveIntegerField(
+        help_text="Per-measurement revision order, starting at 1."
+    )
+    changed_fields = models.JSONField(
+        default=list,
+        help_text="Canonical/raw fields this revision actually changed."
+    )
+
+    dbh_raw = models.FloatField(null=True, blank=True)
+    dbh_unit = models.CharField(max_length=2, null=True, blank=True,
+                                choices=[(u, u) for u in DBH_UNITS])
+    dbh_cm = models.FloatField(null=True, blank=True)
+    height_raw = models.FloatField(null=True, blank=True)
+    height_unit = models.CharField(max_length=2, null=True, blank=True,
+                                   choices=[(u, u) for u in HEIGHT_UNITS])
+    height_m = models.FloatField(null=True, blank=True)
+    x_m = models.FloatField()
+    y_m = models.FloatField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("measurement", "sequence")]
+        ordering = ["measurement", "sequence"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise PermissionError(
+                "MeasurementRevision is append-only; issue a new correction "
+                "order instead of editing history."
+            )
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError("MeasurementRevision is append-only.")
+
+    def __str__(self):
+        return f"revision#{self.sequence} of measurement " \
+               f"{self.measurement_id} (correction {self.correction_id})"
 
 
 class MeasurementImportRow(models.Model):

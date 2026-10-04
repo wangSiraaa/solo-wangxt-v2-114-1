@@ -305,3 +305,348 @@ class EstimatorAcceptanceTests(TestCase):
         self.assertIn("estimator", res["design"])
         self.assertTrue(res["uncertainty_assumptions"])
         self.assertIn("OAK", res["equations_used"])
+
+
+class CorrectionAcceptanceTests(TestCase):
+    """
+    Acceptance tests for the measurement correction order (测量更正单)
+    closed loop: pending -> reviewed -> applied/rejected, append-only
+    revisions, identity re-scan, frozen confirmed editions.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.sA = Stratum.objects.create(code="A", name="A", area_ha=100.0)
+        self.oak = Species.objects.create(code="OAK", name="Oak")
+        self.eq = AllometricEquation.objects.create(
+            code="OAK", version="1", status="confirmed",
+            a=0.1, b=2.0, c=0.5, dbh_min_cm=1.0, dbh_max_cm=100.0,
+            residual_sigma=0.1, citation="fictional")
+        self.eq.species.add(self.oak)
+        self.t1 = Campaign.objects.create(code="t1", measured_on="2019-01-01")
+        self.t2 = Campaign.objects.create(code="t2", measured_on="2024-01-01")
+        self.p1 = Plot.objects.create(
+            code="P1", stratum=self.sA, x_m=0, y_m=0,
+            declared_area_ha=0.25, boundary=rect(0, 0, 50, 50),
+            area_polygon_ha=0.25)
+
+    # ---- helpers -------------------------------------------------------------
+    def _import(self, campaign, rows):
+        return import_campaign_rows(campaign, rows, 0.01)
+
+    def _measurement(self, campaign, field_number):
+        return TreeMeasurement.objects.get(
+            campaign=campaign, field_number_seen=field_number)
+
+    def _run_estimate(self, label="v"):
+        r = self.client.post("/api/estimates/",
+                             dict(label=label, t1_campaign="t1",
+                                  t2_campaign="t2",
+                                  equation_ids=[self.eq.id], fpc=False),
+                             format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        return r.json()
+
+    def _file_correction(self, measurement, key, corrected, **kw):
+        body = dict(measurement_id=measurement.id, idempotency_key=key,
+                    corrected=corrected,
+                    reason=kw.get("reason", "field re-check"),
+                    evidence=kw.get("evidence", "sheet FC-1"))
+        return self.client.post("/api/corrections/", body, format="json")
+
+    def _review_apply(self, cid):
+        r = self.client.post(f"/api/corrections/{cid}/review/",
+                             {"decision": "approve"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        r = self.client.post(f"/api/corrections/{cid}/apply/")
+        self.assertEqual(r.status_code, 200, r.content)
+        return r.json()
+
+    def _survivor_growth(self, version_json):
+        return (version_json["result_payload"]["components"]
+                ["survivor_growth"]["total_kg"])
+
+    # ---- 1. applied unit correction: new draft moves, confirmed frozen -------
+    def test_applied_unit_correction_changes_new_draft_confirmed_untouched(self):
+        # t2 dbh recorded as "25.0 mm" -> canonical 2.5 cm (unit mis-entry);
+        # the field sheet said 25.0 cm.
+        self._import(self.t1, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=24.0, dbh_unit="cm",
+            height_raw=15.0, height_unit="m")])
+        self._import(self.t2, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=25.0, dbh_unit="mm",
+            height_raw=15.5, height_unit="m")])
+        m = self._measurement(self.t2, "1")
+        self.assertAlmostEqual(m.dbh_cm, 2.5)
+
+        v1 = self._run_estimate("confirmed-with-wrong-unit")
+        self.client.post(f"/api/estimates/{v1['id']}/confirm/")
+        frozen_payload = self.client.get(
+            f"/api/estimates/{v1['id']}/").json()["result_payload"]
+
+        cid = self._file_correction(
+            m, "fc-1", {"dbh_raw": 25.0, "dbh_unit": "cm"},
+            reason="sheet reads 25.0 cm, mis-keyed as 25.0 mm").json()["id"]
+        applied = self._review_apply(cid)
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(applied["revision"]["sequence"], 1)
+        self.assertEqual(applied["revision"]["dbh_cm"], 25.0)
+        # the historical row is NOT overwritten
+        m.refresh_from_db()
+        self.assertEqual((m.dbh_raw, m.dbh_unit, m.dbh_cm),
+                         (25.0, "mm", 2.5))
+
+        v2 = self._run_estimate("draft-after-correction")
+        self.assertNotEqual(self._survivor_growth(v2),
+                            self._survivor_growth(v1))
+        # the draft records exactly which revision it used
+        revs = v2["result_payload"]["provenance"]["applied_revisions"]
+        self.assertEqual([r["correction_id"] for r in revs], [cid])
+        self.assertEqual(
+            v2["design_snapshot"]["applied_revision_ids"],
+            [applied["revision"]["id"]])
+
+        # the confirmed edition is byte-stable and still re-readable
+        again = self.client.get(f"/api/estimates/{v1['id']}/").json()
+        self.assertEqual(again["status"], "confirmed")
+        self.assertEqual(again["result_payload"], frozen_payload)
+        self.assertEqual(again["equation_checksum"], v1["equation_checksum"])
+
+    # ---- 2. idempotent submission ---------------------------------------------
+    def test_same_idempotency_key_files_one_order_only(self):
+        self._import(self.t2, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=25.0, dbh_unit="cm",
+            height_raw=15.0, height_unit="m")])
+        m = self._measurement(self.t2, "1")
+        r1 = self._file_correction(m, "dup-key", {"dbh_raw": 26.0,
+                                                  "dbh_unit": "cm"})
+        r2 = self._file_correction(m, "dup-key", {"dbh_raw": 26.0,
+                                                  "dbh_unit": "cm"})
+        self.assertEqual(r1.status_code, 201)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r1.json()["id"], r2.json()["id"])
+        self.assertFalse(r2.json()["created"])
+        from inventory.models import MeasurementCorrection
+        self.assertEqual(MeasurementCorrection.objects.count(), 1)
+        # the same key with a DIFFERENT payload is a conflict, not an order
+        r3 = self._file_correction(m, "dup-key", {"dbh_raw": 99.0,
+                                                  "dbh_unit": "cm"})
+        self.assertEqual(r3.status_code, 409)
+        self.assertEqual(MeasurementCorrection.objects.count(), 1)
+
+    # ---- 3. contradictory reviews cannot both be applied ----------------------
+    def test_contradictory_corrections_cannot_both_be_applied(self):
+        self._import(self.t2, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=25.0, dbh_unit="cm",
+            height_raw=15.0, height_unit="m")])
+        m = self._measurement(self.t2, "1")
+        a = self._file_correction(m, "corr-a", {"dbh_raw": 26.0,
+                                                "dbh_unit": "cm"}).json()
+        b = self._file_correction(m, "corr-b", {"dbh_raw": 27.0,
+                                                "dbh_unit": "cm"}).json()
+        for cid in (a["id"], b["id"]):
+            r = self.client.post(f"/api/corrections/{cid}/review/",
+                                 {"decision": "approve"}, format="json")
+            self.assertEqual(r.status_code, 200)
+        r = self.client.post(f"/api/corrections/{a['id']}/apply/")
+        self.assertEqual(r.status_code, 200, r.content)
+        # B was filed against the same original snapshot, now stale
+        r = self.client.post(f"/api/corrections/{b['id']}/apply/")
+        self.assertEqual(r.status_code, 409, r.content)
+        b_state = self.client.get(f"/api/corrections/{b['id']}/").json()
+        self.assertEqual(b_state["status"], "reviewed")  # not applied
+        from inventory.models import MeasurementRevision
+        self.assertEqual(
+            MeasurementRevision.objects.filter(measurement=m).count(), 1)
+        self.assertEqual(
+            MeasurementRevision.objects.get(measurement=m).dbh_cm, 26.0)
+
+    # ---- 4. coordinate correction opens a conflict; no bypass -----------------
+    def test_coordinate_correction_opens_conflict_and_stays_blocked(self):
+        # t1 tree 7 at (10,10); not re-found at t2. t2 tree 8 recorded far
+        # away at (30,10) -> ingrowth candidate.
+        self._import(self.t1, [dict(
+            plot="P1", field_number="7", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=20.0, dbh_unit="cm",
+            height_raw=14.0, height_unit="m")])
+        self._import(self.t2, [dict(
+            plot="P1", field_number="8", species="OAK", x_m=30, y_m=10,
+            status=AM, dbh_raw=12.0, dbh_unit="cm",
+            height_raw=10.0, height_unit="m")])
+        before = self._run_estimate("before-move")
+        p1 = next(p for p in before["result_payload"]["provenance"]["plots"]
+                  if p["plot"] == "P1")
+        self.assertEqual([i["tree"] for i in p1["ingrowth"]], ["P1/8"])
+
+        # field re-check: tree 8's true position is 0.45 m from tree 7's
+        # t1 position -> possible unrecorded renumber, must be verified.
+        m8 = self._measurement(self.t2, "8")
+        cid = self._file_correction(
+            m8, "fc-coord", {"x_m": 10.4, "y_m": 10.2},
+            reason="GPS offset; true fix next to t1 tag 7").json()["id"]
+        applied = self._review_apply(cid)
+        rescan = applied["identity_rescan"]
+        self.assertTrue(any(c["created"] for c in rescan), rescan)
+
+        from inventory.models import IdentityConflict
+        conflict = IdentityConflict.objects.get(status="open")
+        self.assertEqual(conflict.t2_measurement_id, m8.id)
+
+        # the pair is now BLOCKED: out of every component until a human
+        # verifies — the correction did not merge or count anything.
+        after = self._run_estimate("after-move")
+        prov = after["result_payload"]["provenance"]
+        self.assertEqual(len(prov["open_conflicts"]), 1)
+        self.assertEqual(prov["open_conflicts"][0]["hint"],
+                         "possible_renumber")
+        p1 = next(p for p in prov["plots"] if p["plot"] == "P1")
+        self.assertEqual(p1["ingrowth"], [])
+        self.assertEqual(p1["mortality"], [])
+        self.assertEqual(p1["kg"]["survivor_growth"], 0.0)
+        self.assertEqual(
+            [c["tree"] for c in p1["excluded_identity_conflicts"]],
+            ["P1/7"])
+
+    # ---- 5. interrupted apply: clean state, safe retry ------------------------
+    def test_failed_apply_rolls_back_and_retry_never_duplicates(self):
+        self._import(self.t2, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=25.0, dbh_unit="cm",
+            height_raw=15.0, height_unit="m")])
+        m = self._measurement(self.t2, "1")
+        cid = self._file_correction(m, "fc-fail", {"dbh_raw": 26.0,
+                                                   "dbh_unit": "cm"}).json()
+        self.client.post(f"/api/corrections/{cid['id']}/review/",
+                         {"decision": "approve"}, format="json")
+
+        # simulate a crash mid-apply (identity re-scan blows up)
+        import inventory.services.corrections as corr_mod
+        original = corr_mod.scan_conflicts
+        corr_mod.scan_conflicts = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("simulated power cut"))
+        try:
+            r = self.client.post(f"/api/corrections/{cid['id']}/apply/")
+        finally:
+            corr_mod.scan_conflicts = original
+        self.assertEqual(r.status_code, 500)
+
+        # after "refresh": a complete failed state, nothing half-written
+        from inventory.models import MeasurementRevision
+        state = self.client.get(f"/api/corrections/{cid['id']}/").json()
+        self.assertEqual(state["status"], "failed")
+        self.assertIsNone(state["revision"])
+        self.assertEqual(MeasurementRevision.objects.count(), 0)
+        m.refresh_from_db()
+        self.assertEqual(m.dbh_cm, 25.0)  # base row untouched
+
+        # retry succeeds and creates exactly ONE effective revision
+        r = self.client.post(f"/api/corrections/{cid['id']}/apply/")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(MeasurementRevision.objects.count(), 1)
+        # applying again is idempotent — still one revision
+        r = self.client.post(f"/api/corrections/{cid['id']}/apply/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(MeasurementRevision.objects.count(), 1)
+        self.assertEqual(MeasurementRevision.objects.get().sequence, 1)
+
+    # ---- 6. impact view + recompute-by-order ----------------------------------
+    def test_impact_view_and_recompute_by_correction(self):
+        self._import(self.t1, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=24.0, dbh_unit="cm",
+            height_raw=15.0, height_unit="m")])
+        self._import(self.t2, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=25.0, dbh_unit="mm",
+            height_raw=15.5, height_unit="m")])
+        m = self._measurement(self.t2, "1")
+        v1 = self._run_estimate("confirmed")
+        self.client.post(f"/api/estimates/{v1['id']}/confirm/")
+
+        cid = self._file_correction(
+            m, "fc-impact", {"dbh_raw": 25.0, "dbh_unit": "cm"}).json()["id"]
+
+        # impact BEFORE apply: shows the pending diff and the frozen edition
+        imp = self.client.get(f"/api/corrections/{cid}/impact/").json()
+        self.assertEqual(imp["current_effective"]["dbh_cm"], 2.5)
+        self.assertEqual(imp["projected_after_apply"]["dbh_cm"], 25.0)
+        self.assertIn("dbh_cm", imp["changed_fields"])
+        self.assertEqual(imp["estimate_versions"][0]["id"], v1["id"])
+        self.assertIn("frozen", imp["estimate_versions"][0]["effect"])
+
+        # recompute is refused before the order is applied
+        r = self.client.post(f"/api/corrections/{cid}/recompute/",
+                             {"equation_ids": [self.eq.id]}, format="json")
+        self.assertEqual(r.status_code, 409)
+
+        self._review_apply(cid)
+        r = self.client.post(f"/api/corrections/{cid}/recompute/",
+                             {"equation_ids": [self.eq.id],
+                              "label": "after unit fix"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        new_version = r.json()["version"]
+        diff = r.json()["diff"]
+        self.assertEqual(new_version["status"], "draft")
+        self.assertEqual(diff["compared_to"]["id"], v1["id"])
+        delta = diff["components"]["survivor_growth"]["delta_kg"]
+        self.assertNotEqual(delta, 0.0)
+        self.assertEqual(diff["components"]["survivor_growth"]
+                         ["before_total_kg"],
+                         round(self._survivor_growth(v1), 3))
+        # confirmed edition still untouched after the recompute
+        again = self.client.get(f"/api/estimates/{v1['id']}/").json()
+        self.assertEqual(self._survivor_growth(again),
+                         self._survivor_growth(v1))
+
+    # ---- guards ----------------------------------------------------------------
+    def test_correction_validates_values_and_workflow(self):
+        self._import(self.t2, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=25.0, dbh_unit="cm",
+            height_raw=15.0, height_unit="m")])
+        m = self._measurement(self.t2, "1")
+        # 250 cm fails the plausible-range check, same as at ingest
+        r = self._file_correction(m, "bad-1", {"dbh_raw": 250.0,
+                                               "dbh_unit": "cm"})
+        self.assertEqual(r.status_code, 400)
+        # coordinates outside the plot boundary are refused
+        r = self._file_correction(m, "bad-2", {"x_m": 500.0, "y_m": 500.0})
+        self.assertEqual(r.status_code, 400)
+        # a bare number without its unit is never accepted
+        r = self._file_correction(m, "bad-3", {"dbh_raw": 26.0,
+                                               "dbh_unit": None})
+        self.assertEqual(r.status_code, 400)
+        # apply before review is a workflow conflict
+        ok = self._file_correction(m, "ok-1", {"dbh_raw": 26.0,
+                                               "dbh_unit": "cm"}).json()
+        r = self.client.post(f"/api/corrections/{ok['id']}/apply/")
+        self.assertEqual(r.status_code, 409)
+        # rejected orders cannot be applied either
+        self.client.post(f"/api/corrections/{ok['id']}/review/",
+                         {"decision": "reject"}, format="json")
+        r = self.client.post(f"/api/corrections/{ok['id']}/apply/")
+        self.assertEqual(r.status_code, 409)
+        from inventory.models import MeasurementRevision
+        self.assertEqual(MeasurementRevision.objects.count(), 0)
+
+    def test_revision_is_append_only(self):
+        self._import(self.t2, [dict(
+            plot="P1", field_number="1", species="OAK", x_m=10, y_m=10,
+            status=AM, dbh_raw=25.0, dbh_unit="cm",
+            height_raw=15.0, height_unit="m")])
+        m = self._measurement(self.t2, "1")
+        cid = self._file_correction(m, "fc-immutable",
+                                    {"dbh_raw": 26.0,
+                                     "dbh_unit": "cm"}).json()["id"]
+        self._review_apply(cid)
+        from inventory.models import MeasurementRevision
+        rev = MeasurementRevision.objects.get()
+        rev.dbh_cm = 99.0
+        with self.assertRaises(PermissionError):
+            rev.save()
+        with self.assertRaises(PermissionError):
+            rev.delete()

@@ -1,12 +1,21 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { api } from "../api.js";
 
 /**
  * One plot: boundary + every individual's t1 -> t2 remeasurement.
  * Identity is the internal tree row; labels shown are what was on the tag.
+ * Correction orders and their revision chain are shown per measurement;
+ * open identity conflicts on this plot are the blocked items.
  */
 export default function PlotDetail({ plotCode, ctx, onBack }) {
-  const { plots, m1, m2, t1, t2 } = ctx;
+  const { plots, m1, m2, t1, t2, conflicts } = ctx;
   const plot = plots.find((p) => p.code === plotCode);
+  const [corrections, setCorrections] = useState([]);
+
+  useEffect(() => {
+    api.corrections(`?plot=${encodeURIComponent(plotCode)}`)
+      .then(setCorrections).catch(() => setCorrections([]));
+  }, [plotCode]);
 
   const rows = useMemo(() => {
     const a = m1.filter((m) => m.plot_code === plotCode);
@@ -24,6 +33,21 @@ export default function PlotDetail({ plotCode, ctx, onBack }) {
       return nx.localeCompare(ny);
     });
   }, [m1, m2, plotCode]);
+
+  // measurement id -> its correction orders (the revision chain)
+  const corrByMeasurement = useMemo(() => {
+    const map = new Map();
+    corrections.forEach((c) => {
+      const list = map.get(c.measurement) || [];
+      list.push(c);
+      map.set(c.measurement, list);
+    });
+    return map;
+  }, [corrections]);
+
+  const blocked = useMemo(
+    () => (conflicts || []).filter((c) => c.plot === plot?.id),
+    [conflicts, plot]);
 
   if (!plot) return null;
   const xs = plot.boundary.map(([x]) => x);
@@ -44,6 +68,18 @@ export default function PlotDetail({ plotCode, ctx, onBack }) {
       return "growth";
     }
     return r.t2 ? "ingrowth" : "lost";
+  }
+
+  function revisionBadges(m) {
+    if (!m) return null;
+    const list = corrByMeasurement.get(m.id) || [];
+    return list.map((c) => (
+      <span key={c.id}
+            className={`rev-badge corr-status-${c.status}`}
+            title={`${c.reason} — 证据: ${c.evidence}`}>
+        ✎#{c.id} {c.status}
+        {c.revision ? ` rev${c.revision.sequence}` : ""}
+      </span>));
   }
 
   return (
@@ -116,10 +152,14 @@ export default function PlotDetail({ plotCode, ctx, onBack }) {
                   <td>{d1 ?? "—"}
                     {r.t1?.dbh_unit && r.t1.dbh_unit !== "cm" &&
                       <small> ({r.t1.dbh_raw} {r.t1.dbh_unit})</small>}
+                    {revisionBadges(r.t1)}
                   </td>
                   <td>{d2 ?? "—"}
                     {r.t2?.dbh_unit && r.t2.dbh_unit !== "cm" &&
                       <small> ({r.t2.dbh_raw} {r.t2.dbh_unit})</small>}
+                    {revisionBadges(r.t2)}
+                    {r.t2 && <small className="meas-id">
+                      {" "}meas #{r.t2.id}</small>}
                   </td>
                   <td>{delta}</td>
                   <td>{source}</td>
@@ -129,6 +169,76 @@ export default function PlotDetail({ plotCode, ctx, onBack }) {
           </tbody>
         </table>
       </div>
+
+      {(corrections.length > 0 || blocked.length > 0) && (
+        <div className="plot-audit">
+          {corrections.length > 0 && (
+            <section>
+              <h3>Revision chain (测量更正单)</h3>
+              <table className="correction-table">
+                <thead>
+                  <tr><th>order</th><th>measurement</th><th>before → after</th>
+                  <th>status</th><th>reason / evidence</th></tr>
+                </thead>
+                <tbody>
+                  {corrections.map((c) => (
+                    <tr key={c.id} className={`corr-${c.status}`}>
+                      <td>#{c.id}</td>
+                      <td>{c.field_number} @{c.campaign_code}
+                        <br /><small>meas #{c.measurement}</small></td>
+                      <td>
+                        <ChainDiff c={c} />
+                        {c.revision &&
+                          <span className="rev-badge">
+                            revision #{c.revision.sequence} — historical row
+                            preserved</span>}
+                      </td>
+                      <td><span className={`badge corr-status-${c.status}`}>
+                        {c.status}</span></td>
+                      <td><small>{c.reason}<br />证据: {c.evidence}</small></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
+          {blocked.length > 0 && (
+            <section>
+              <h3>Blocked identity items (awaiting human verification)</h3>
+              {blocked.map((c) => (
+                <span key={c.id} className="conflict-chip">
+                  {c.field_number} · {c.distance_m?.toFixed(2)} m — excluded
+                  from every component until verified
+                </span>
+              ))}
+            </section>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+function ChainDiff({ c }) {
+  const snap = c.original_snapshot || {};
+  const cor = c.corrected || {};
+  const out = [];
+  if (cor.dbh_raw !== undefined || cor.dbh_unit !== undefined) {
+    out.push(
+      <div key="dbh">
+        dbh <s>{snap.dbh_raw} {snap.dbh_unit}</s> →{" "}
+        <strong>{cor.dbh_raw ?? snap.dbh_raw}{" "}
+          {cor.dbh_unit ?? snap.dbh_unit}</strong>
+        {c.revision &&
+          <small> (canonical {snap.dbh_cm} → {c.revision.dbh_cm} cm)</small>}
+      </div>);
+  }
+  if (cor.x_m !== undefined || cor.y_m !== undefined) {
+    out.push(
+      <div key="xy">
+        pos <s>{snap.x_m}, {snap.y_m}</s> →{" "}
+        <strong>{cor.x_m ?? snap.x_m}, {cor.y_m ?? snap.y_m}</strong>
+      </div>);
+  }
+  return out.length ? <>{out}</> : <small>—</small>;
 }
